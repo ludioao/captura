@@ -186,7 +186,8 @@ struct EditorView: View {
                 playhead: playback.currentTime,
                 selectedClipID: selectedClipID,
                 seek: playback.seek,
-                select: { selectedClipID = $0 }
+                select: { selectedClipID = $0 },
+                moveCameraKeyframe: moveCameraKeyframe
             )
             .frame(height: 190)
             .padding(.horizontal, 20)
@@ -298,8 +299,11 @@ struct EditorView: View {
             }
             .keyboardShortcut("s")
             .disabled(!hasUnsavedChanges)
-            Button {
-                showsExportSettings = true
+            Menu {
+                Button("Quick export with last settings", action: quickExport)
+                    .disabled(lastExportSettings == nil)
+                Divider()
+                Button("Export settings…") { showsExportSettings = true }
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
@@ -440,6 +444,13 @@ struct EditorView: View {
                 AudioInspector(settings: audioBinding)
             case .cursor:
                 CursorInspector(settings: cursorBinding)
+            case .zoom:
+                ZoomInspector(
+                    keyframes: $project.cameraKeyframes,
+                    sourceTime: project.timeline.sourceTime(at: playback.currentTime) ?? playback.currentTime,
+                    duration: sourceDuration,
+                    seekToSourceTime: seekToSourceTime
+                )
             case .captions:
                 CaptionInspector(
                     captions: project.captions ?? [],
@@ -615,6 +626,26 @@ struct EditorView: View {
         hasUnsavedChanges = true
     }
 
+    private var sourceDuration: Double {
+        project.timeline.clips.map(\.sourceEnd).max() ?? project.duration
+    }
+
+    private func seekToSourceTime(_ sourceTime: Double) {
+        guard let timelineTime = project.timeline.firstTimelineTime(forSourceTime: sourceTime) else { return }
+        playback.seek(to: timelineTime)
+    }
+
+    @discardableResult
+    private func moveCameraKeyframe(from previousSourceTime: Double, to timelineTime: Double) -> Double? {
+        guard let index = project.cameraKeyframes.indices.min(by: {
+            abs(project.cameraKeyframes[$0].time - previousSourceTime) < abs(project.cameraKeyframes[$1].time - previousSourceTime)
+        }), let sourceTime = project.timeline.sourceTime(at: timelineTime) else { return nil }
+        let clampedTime = min(max(sourceTime, 0), sourceDuration)
+        project.cameraKeyframes[index].time = clampedTime
+        hasUnsavedChanges = true
+        return clampedTime
+    }
+
     private func startExport(_ settings: ExportSettings) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = settings.format == .gif ? [.gif] : [.mpeg4Movie]
@@ -624,6 +655,34 @@ struct EditorView: View {
         panel.nameFieldStringValue = "\(openProject.packageURL.deletingPathExtension().lastPathComponent).\(fileExtension)"
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         showsExportSettings = false
+        exportCoordinator.start(
+            project: project,
+            packageURL: openProject.packageURL,
+            destination: destination,
+            settings: settings
+        )
+    }
+
+    private var lastExportSettings: ExportSettings? {
+        guard let data = UserDefaults.standard.data(forKey: "captura.lastExportSettings") else { return nil }
+        return try? JSONDecoder().decode(ExportSettings.self, from: data)
+    }
+
+    private func quickExport() {
+        guard let settings = lastExportSettings else {
+            showsExportSettings = true
+            return
+        }
+        let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+            ?? openProject.packageURL.deletingLastPathComponent()
+        let fileExtension = settings.format == .gif ? "gif" : "mp4"
+        let baseName = openProject.packageURL.deletingPathExtension().lastPathComponent
+        var destination = directory.appending(path: "\(baseName).\(fileExtension)")
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: destination.path) {
+            destination = directory.appending(path: "\(baseName)-\(suffix).\(fileExtension)")
+            suffix += 1
+        }
         exportCoordinator.start(
             project: project,
             packageURL: openProject.packageURL,
@@ -738,13 +797,14 @@ private enum ExportPreset: String, CaseIterable, Identifiable {
 }
 
 private enum EditorInspectorSection: String, CaseIterable, Identifiable {
-    case canvas, audio, cursor, captions, overlays
+    case canvas, audio, cursor, zoom, captions, overlays
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .canvas: "paintpalette"
         case .audio: "waveform"
         case .cursor: "cursorarrow.motionlines"
+        case .zoom: "viewfinder"
         case .captions: "captions.bubble"
         case .overlays: "rectangle.dashed"
         }
@@ -843,6 +903,74 @@ private struct CursorInspector: View {
     }
 }
 
+private struct ZoomInspector: View {
+    @Binding var keyframes: [CameraKeyframe]
+    let sourceTime: Double
+    let duration: Double
+    let seekToSourceTime: (Double) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Camera motion").font(.headline)
+                Text("Drag the diamond handles in the camera lane, then refine scale, focus and easing here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+
+            if keyframes.isEmpty {
+                ContentUnavailableView("No zooms", systemImage: "viewfinder")
+            } else {
+                List {
+                    ForEach(keyframes.indices, id: \.self) { index in
+                        zoomRow(index: index)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func zoomRow(index: Int) -> some View {
+        let isNearPlayhead = abs(keyframes[index].time - sourceTime) < 0.15
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Button {
+                    seekToSourceTime(keyframes[index].time)
+                } label: {
+                    Label(
+                        String(format: "%.2fs", keyframes[index].time),
+                        systemImage: isNearPlayhead ? "play.fill" : "diamond.fill"
+                    )
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Button(role: .destructive) {
+                    keyframes.remove(at: index)
+                } label: { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+            }
+            LabeledContent("Time", value: String(format: "%.2fs", keyframes[index].time))
+            Slider(value: $keyframes[index].time, in: 0...max(duration, 0.1))
+            LabeledContent("Zoom", value: String(format: "%.2f×", keyframes[index].scale))
+            Slider(value: $keyframes[index].scale, in: 1...4)
+            LabeledContent("Horizontal", value: "\(Int(keyframes[index].centerX * 100))%")
+            Slider(value: $keyframes[index].centerX, in: 0...1)
+            LabeledContent("Vertical", value: "\(Int(keyframes[index].centerY * 100))%")
+            Slider(value: $keyframes[index].centerY, in: 0...1)
+            Picker("Easing", selection: $keyframes[index].easing) {
+                Text("Linear").tag(CameraEasing.linear)
+                Text("Smooth").tag(CameraEasing.easeInOut)
+                Text("Spring").tag(CameraEasing.spring)
+            }
+        }
+        .padding(.vertical, 5)
+    }
+}
+
 private struct CaptionInspector: View {
     let captions: [CaptionCue]
     let add: () -> Void
@@ -905,6 +1033,8 @@ private struct TimelineCanvas: View {
     let selectedClipID: UUID?
     let seek: (Double) -> Void
     let select: (UUID?) -> Void
+    let moveCameraKeyframe: (Double, Double) -> Double?
+    @State private var draggedCameraSourceTime: Double?
 
     private let labelWidth = 72.0
 
@@ -914,13 +1044,29 @@ private struct TimelineCanvas: View {
                 draw(in: &context, size: size)
             }
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                let time = time(at: value.location.x, width: proxy.size.width)
-                seek(time)
-                if value.location.y < 72 {
-                    select(timeline.clips.first(where: { time >= $0.timelineStart && time <= $0.timelineStart + $0.duration })?.id)
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    let timelineTime = time(at: value.location.x, width: proxy.size.width)
+                    if draggedCameraSourceTime == nil, (69...100).contains(value.startLocation.y) {
+                        draggedCameraSourceTime = nearestCameraKeyframe(
+                            to: value.startLocation.x,
+                            width: proxy.size.width,
+                            maximumDistance: 14
+                        )
+                    }
+                    if let sourceTime = draggedCameraSourceTime {
+                        draggedCameraSourceTime = moveCameraKeyframe(sourceTime, timelineTime) ?? sourceTime
+                    } else {
+                        seek(timelineTime)
+                        if value.location.y < 69 {
+                            select(timeline.clips.first(where: {
+                                timelineTime >= $0.timelineStart && timelineTime <= $0.timelineStart + $0.duration
+                            })?.id)
+                        }
+                    }
                 }
-            })
+                .onEnded { _ in draggedCameraSourceTime = nil }
+            )
         }
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .accessibilityLabel("Project timeline")
@@ -944,9 +1090,10 @@ private struct TimelineCanvas: View {
             context.fill(Path(roundedRect: rect, cornerRadius: 4), with: .color(color))
         }
 
-        for (index, frame) in cameraKeyframes.enumerated() where frame.scale > 1 {
+        let sortedCameraKeyframes = cameraKeyframes.sorted { $0.time < $1.time }
+        for (index, frame) in sortedCameraKeyframes.enumerated() where frame.scale > 1 {
             guard let frameTime = timeline.firstTimelineTime(forSourceTime: frame.time) else { continue }
-            let nextSourceTime = index + 1 < cameraKeyframes.count ? cameraKeyframes[index + 1].time : frame.time + 1
+            let nextSourceTime = index + 1 < sortedCameraKeyframes.count ? sortedCameraKeyframes[index + 1].time : frame.time + 1
             let nextTime = timeline.firstTimelineTime(forSourceTime: nextSourceTime) ?? min(duration, frameTime + 1)
             let rect = CGRect(
                 x: labelWidth + frameTime / duration * trackWidth,
@@ -955,6 +1102,20 @@ private struct TimelineCanvas: View {
                 height: 23
             )
             context.fill(Path(roundedRect: rect, cornerRadius: 3), with: .color(.purple.opacity(0.8)))
+        }
+
+        for frame in sortedCameraKeyframes {
+            guard let frameTime = timeline.firstTimelineTime(forSourceTime: frame.time) else { continue }
+            let x = labelWidth + frameTime / duration * trackWidth
+            let handle = Path { path in
+                path.move(to: CGPoint(x: x, y: 72))
+                path.addLine(to: CGPoint(x: x + 5, y: 84.5))
+                path.addLine(to: CGPoint(x: x, y: 97))
+                path.addLine(to: CGPoint(x: x - 5, y: 84.5))
+                path.closeSubpath()
+            }
+            context.fill(handle, with: .color(frame.scale > 1 ? .white : .purple.opacity(0.9)))
+            context.stroke(handle, with: .color(.purple), lineWidth: 1.5)
         }
 
         for event in events where event.type == .mouseMove || event.type == .click {
@@ -993,6 +1154,18 @@ private struct TimelineCanvas: View {
     private func time(at x: Double, width: Double) -> Double {
         let fraction = min(max((x - labelWidth) / max(1, width - labelWidth - 12), 0), 1)
         return fraction * timeline.duration
+    }
+
+    private func nearestCameraKeyframe(to x: CGFloat, width: CGFloat, maximumDistance: CGFloat) -> Double? {
+        let duration = max(timeline.duration, 0.001)
+        let trackWidth = max(1, width - labelWidth - 12)
+        return cameraKeyframes.compactMap { frame -> (Double, CGFloat)? in
+            guard let timelineTime = timeline.firstTimelineTime(forSourceTime: frame.time) else { return nil }
+            let handleX = labelWidth + timelineTime / duration * trackWidth
+            return (frame.time, abs(handleX - x))
+        }
+        .filter { $0.1 <= maximumDistance }
+        .min { $0.1 < $1.1 }?.0
     }
 
     private func format(_ seconds: Double) -> String {

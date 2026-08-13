@@ -43,7 +43,7 @@ Outcome: a user records, edits and exports a polished MP4 without leaving Captur
 - [x] Continuous export progress and disk-space preflight.
 - [x] Metal frame core, texture cache, shader pipeline and IOSurface output.
 - [ ] Route the complete canvas/webcam/effect graph through Metal for pixel-perfect preview/export parity.
-- Quick export using the last successful settings.
+- [x] Quick export using the last successful settings with collision-safe filenames.
 
 Acceptance:
 
@@ -56,7 +56,7 @@ Acceptance:
 Outcome: raw recordings automatically become easy-to-follow demos.
 
 - [x] Automatic zoom playback/export and manual add/remove at the playhead.
-- [ ] Drag-editable zoom ranges and easing handles on the timeline.
+- [x] Drag-editable zoom keyframes on the timeline with scale, focus and easing controls.
 - Spring/easing-based camera motion with safe framing for portrait output.
 - [x] Smoothed cursor path, post-recording cursor sizing and static-cursor hiding.
 - High-resolution replacement for known macOS cursor types.

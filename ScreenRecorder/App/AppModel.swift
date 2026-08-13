@@ -91,6 +91,10 @@ final class AppModel: ObservableObject {
     }
 
     func prepareForRecording() async {
+        let recovered = await projectStore.recoverInterruptedRecordings()
+        if !recovered.isEmpty {
+            sourceStatusMessage = "Recovered \(recovered.count) interrupted recording\(recovered.count == 1 ? "" : "s")."
+        }
         refreshMicrophones()
         refreshCameras()
         refreshExternalDevices()

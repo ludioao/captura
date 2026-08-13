@@ -35,6 +35,7 @@ final class MediaWriter: @unchecked Sendable {
         self.timeline = timeline
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+            writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
         } catch {
             throw RecorderError.encoderInitializationFailed(error.localizedDescription)
         }

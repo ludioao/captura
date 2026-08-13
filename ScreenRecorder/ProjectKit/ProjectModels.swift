@@ -111,8 +111,49 @@ struct ProjectAudioSettings: Codable, Hashable, Sendable {
     var microphoneVolume = 1.0
     var systemMuted = false
     var microphoneMuted = false
+    var voiceEnhancement = false
+    var noiseReduction = false
+    var clickSounds = false
+    var clickVolume = 0.55
 
     static let `default` = ProjectAudioSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case systemVolume, microphoneVolume, systemMuted, microphoneMuted
+        case voiceEnhancement, noiseReduction, clickSounds, clickVolume
+    }
+
+    init(
+        systemVolume: Double = 1,
+        microphoneVolume: Double = 1,
+        systemMuted: Bool = false,
+        microphoneMuted: Bool = false,
+        voiceEnhancement: Bool = false,
+        noiseReduction: Bool = false,
+        clickSounds: Bool = false,
+        clickVolume: Double = 0.55
+    ) {
+        self.systemVolume = systemVolume
+        self.microphoneVolume = microphoneVolume
+        self.systemMuted = systemMuted
+        self.microphoneMuted = microphoneMuted
+        self.voiceEnhancement = voiceEnhancement
+        self.noiseReduction = noiseReduction
+        self.clickSounds = clickSounds
+        self.clickVolume = clickVolume
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        systemVolume = try values.decodeIfPresent(Double.self, forKey: .systemVolume) ?? 1
+        microphoneVolume = try values.decodeIfPresent(Double.self, forKey: .microphoneVolume) ?? 1
+        systemMuted = try values.decodeIfPresent(Bool.self, forKey: .systemMuted) ?? false
+        microphoneMuted = try values.decodeIfPresent(Bool.self, forKey: .microphoneMuted) ?? false
+        voiceEnhancement = try values.decodeIfPresent(Bool.self, forKey: .voiceEnhancement) ?? false
+        noiseReduction = try values.decodeIfPresent(Bool.self, forKey: .noiseReduction) ?? false
+        clickSounds = try values.decodeIfPresent(Bool.self, forKey: .clickSounds) ?? false
+        clickVolume = try values.decodeIfPresent(Double.self, forKey: .clickVolume) ?? 0.55
+    }
 }
 
 struct CursorAppearance: Codable, Hashable, Sendable {
@@ -168,6 +209,27 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var timeline: Timeline
     var captions: [CaptionCue]? = nil
     var overlays: [OverlayRegion]? = nil
+}
+
+struct CapturaPreset: Codable, Identifiable, Hashable, Sendable {
+    static let currentFormatVersion = 1
+
+    var formatVersion = currentFormatVersion
+    var id = UUID()
+    var name: String
+    var appearance: CanvasAppearance
+    var audio: ProjectAudioSettings
+    var cursor: CursorAppearance
+    var export: ExportSettings?
+}
+
+struct RecordingRecoveryManifest: Codable, Hashable, Sendable {
+    var createdAt: Date
+    var canvas: CanvasSize
+    var sourceDisplay: CanvasSize
+    var frameRate: Int
+    var codec: VideoCodec
+    var hasWebcam: Bool
 }
 
 struct RecentProject: Identifiable, Hashable, Sendable {

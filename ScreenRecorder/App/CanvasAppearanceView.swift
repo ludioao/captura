@@ -279,8 +279,11 @@ private struct CameraResizeHandle: View {
 
 struct CanvasAppearanceInspector: View {
     @Binding var appearance: CanvasAppearance
+    @Binding var audio: ProjectAudioSettings
+    @Binding var cursor: CursorAppearance
     let hasCamera: Bool
-    @State private var savedPresets = CanvasPresetStore.load()
+    @State private var savedPresets = CapturaPresetStore.load()
+    @State private var presetError: String?
 
     var body: some View {
         ScrollView {
@@ -292,23 +295,35 @@ struct CanvasAppearanceInspector: View {
                     Menu("Presets") {
                         Button("Captura Default") { appearance = .default }
                         ForEach(savedPresets) { preset in
-                            Button(preset.name) { appearance = preset.appearance }
+                            Button(preset.name) { apply(preset) }
                         }
                         if !savedPresets.isEmpty {
                             Divider()
                             Button("Clear saved presets", role: .destructive) {
                                 savedPresets = []
-                                CanvasPresetStore.save(savedPresets)
+                                CapturaPresetStore.save(savedPresets)
                             }
                         }
                     }
                     Button("Save current") {
-                        savedPresets.append(SavedCanvasPreset(
+                        savedPresets.append(CapturaPreset(
                             name: "Preset \(savedPresets.count + 1)",
-                            appearance: appearance
+                            appearance: appearance,
+                            audio: audio,
+                            cursor: cursor,
+                            export: lastExportSettings
                         ))
-                        CanvasPresetStore.save(savedPresets)
+                        CapturaPresetStore.save(savedPresets)
                     }
+                    Menu {
+                        Button("Import preset…", action: importPreset)
+                        ForEach(savedPresets) { preset in
+                            Button("Export \(preset.name)…") { exportPreset(preset) }
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up.on.square")
+                    }
+                    .help("Import or export .capturapreset files")
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -363,6 +378,14 @@ struct CanvasAppearanceInspector: View {
             .padding(20)
         }
         .background(Color(nsColor: .underPageBackgroundColor))
+        .alert("Preset error", isPresented: Binding(
+            get: { presetError != nil },
+            set: { if !$0 { presetError = nil } }
+        )) {
+            Button("OK", role: .cancel) { presetError = nil }
+        } message: {
+            Text(presetError ?? "Unknown preset error")
+        }
     }
 
     private var cameraControls: some View {
@@ -463,22 +486,47 @@ struct CanvasAppearanceInspector: View {
             }
         )
     }
-}
 
-private struct SavedCanvasPreset: Codable, Identifiable {
-    var id = UUID()
-    var name: String
-    var appearance: CanvasAppearance
-}
-
-private enum CanvasPresetStore {
-    private static let key = "captura.canvasPresets"
-    static func load() -> [SavedCanvasPreset] {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
-        return (try? JSONDecoder().decode([SavedCanvasPreset].self, from: data)) ?? []
+    private func importPreset() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "capturapreset") ?? .json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let preset = try CapturaPresetStore.importPreset(from: url)
+            savedPresets.removeAll { $0.id == preset.id }
+            savedPresets.append(preset)
+            CapturaPresetStore.save(savedPresets)
+            apply(preset)
+        } catch {
+            presetError = error.localizedDescription
+        }
     }
-    static func save(_ presets: [SavedCanvasPreset]) {
-        UserDefaults.standard.set(try? JSONEncoder().encode(presets), forKey: key)
+
+    private func exportPreset(_ preset: CapturaPreset) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "capturapreset") ?? .json]
+        panel.nameFieldStringValue = "\(preset.name).capturapreset"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try CapturaPresetStore.export(preset, to: url)
+        } catch {
+            presetError = error.localizedDescription
+        }
+    }
+
+    private var lastExportSettings: ExportSettings? {
+        guard let data = UserDefaults.standard.data(forKey: "captura.lastExportSettings") else { return nil }
+        return try? JSONDecoder().decode(ExportSettings.self, from: data)
+    }
+
+    private func apply(_ preset: CapturaPreset) {
+        appearance = preset.appearance
+        audio = preset.audio
+        cursor = preset.cursor
+        if let export = preset.export, let data = try? JSONEncoder().encode(export) {
+            UserDefaults.standard.set(data, forKey: "captura.lastExportSettings")
+        }
     }
 }
 

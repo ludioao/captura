@@ -90,7 +90,85 @@ actor ProjectStore {
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(events).write(to: package.eventsURL, options: .atomic)
         try encoder.encode(project).write(to: package.rootURL.appending(path: "project.json"), options: .atomic)
+        try? fileManager.removeItem(at: package.rootURL.appending(path: "autosave/recovery.json"))
         Log.project.info("Saved project package with \(events.count) interaction events")
+    }
+
+    func writeRecoveryManifest(_ manifest: RecordingRecoveryManifest, to package: ProjectPackage) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(manifest).write(
+            to: package.rootURL.appending(path: "autosave/recovery.json"),
+            options: .atomic
+        )
+    }
+
+    func recoverInterruptedRecordings(in parent: URL? = nil) async -> [URL] {
+        let base: URL
+        do {
+            base = try parent ?? fileManager.url(
+                for: .moviesDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+        } catch { return [] }
+        guard let packages = try? fileManager.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var recovered: [URL] = []
+        for root in packages where root.pathExtension.lowercased() == "screenproject" {
+            guard !fileManager.fileExists(atPath: root.appending(path: "project.json").path) else { continue }
+            let manifestURL = root.appending(path: "autosave/recovery.json")
+            let mediaURL = root.appending(path: "media/screen.mov")
+            guard fileManager.fileExists(atPath: manifestURL.path),
+                  fileManager.fileExists(atPath: mediaURL.path),
+                  let data = try? Data(contentsOf: manifestURL) else { continue }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let manifest = try? decoder.decode(RecordingRecoveryManifest.self, from: data) else { continue }
+            let asset = AVURLAsset(url: mediaURL)
+            guard let durationValue = try? await asset.load(.duration), durationValue.seconds > 0.05,
+                  let _ = try? await asset.loadTracks(withMediaType: .video).first else { continue }
+            let duration = durationValue.seconds
+            let mediaID = UUID()
+            let cameraURL = root.appending(path: "media/camera.mov")
+            let cameraSize = (try? cameraURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let project = ScreenProject(
+                id: UUID(),
+                createdAt: manifest.createdAt,
+                duration: duration,
+                media: ProjectMedia(
+                    screen: "media/screen.mov",
+                    camera: manifest.hasWebcam && cameraSize > 0 ? "media/camera.mov" : nil
+                ),
+                settings: ProjectSettings(
+                    canvas: manifest.canvas,
+                    sourceDisplay: manifest.sourceDisplay,
+                    frameRate: manifest.frameRate,
+                    codec: manifest.codec,
+                    appearance: .default
+                ),
+                recording: RecordingMetadata(eventsPath: "metadata/events.json", eventCount: 0, droppedVideoFrames: 0),
+                cameraKeyframes: [],
+                timeline: Timeline(clips: [TimelineClip(
+                    id: UUID(), sourceMediaID: mediaID,
+                    sourceStart: 0, sourceEnd: duration, timelineStart: 0
+                )])
+            )
+            let package = package(at: root, project: project)
+            do {
+                try save(project: project, events: [], to: package)
+                recovered.append(root)
+            } catch {
+                Log.project.error("Could not recover interrupted recording: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return recovered
     }
 
     func update(project: ScreenProject, events: [InteractionEvent], at rootURL: URL) throws {
@@ -163,5 +241,18 @@ actor ProjectStore {
             candidate = parent.appending(path: "\(name) \(counter).\(pathExtension)", directoryHint: .isDirectory)
         }
         return candidate
+    }
+
+    private func package(at root: URL, project: ScreenProject) -> ProjectPackage {
+        let media = root.appending(path: "media", directoryHint: .isDirectory)
+        let metadata = root.appending(path: "metadata", directoryHint: .isDirectory)
+        return ProjectPackage(
+            rootURL: root,
+            mediaDirectory: media,
+            metadataDirectory: metadata,
+            screenMediaURL: root.appending(path: project.media.screen),
+            cameraMediaURL: root.appending(path: project.media.camera ?? "media/camera.mov"),
+            eventsURL: root.appending(path: project.recording.eventsPath)
+        )
     }
 }

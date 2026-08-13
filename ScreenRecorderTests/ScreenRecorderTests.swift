@@ -77,6 +77,34 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(decoded.settings.appearance, project.settings.appearance)
     }
 
+    func testLegacyAudioSettingsGainProcessingDefaults() throws {
+        let settings = try JSONDecoder().decode(ProjectAudioSettings.self, from: Data(#"{"systemVolume":0.8}"#.utf8))
+
+        XCTAssertEqual(settings.systemVolume, 0.8)
+        XCTAssertFalse(settings.voiceEnhancement)
+        XCTAssertFalse(settings.noiseReduction)
+        XCTAssertFalse(settings.clickSounds)
+    }
+
+    func testCapturaPresetRoundTripsAsShareableJSON() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "Tutorial.capturapreset")
+        let preset = CapturaPreset(
+            name: "Tutorial",
+            appearance: .default,
+            audio: ProjectAudioSettings(voiceEnhancement: true, noiseReduction: true, clickSounds: true),
+            cursor: .default,
+            export: .mp4(resolution: CanvasSize(width: 1920, height: 1080), fps: 60)
+        )
+
+        try CapturaPresetStore.export(preset, to: url)
+        let decoded = try CapturaPresetStore.importPreset(from: url)
+
+        XCTAssertEqual(decoded, preset)
+    }
+
     func testLegacyCanvasAppearanceGetsCameraPlacementDefaults() throws {
         let legacyJSON = Data(#"""
         {

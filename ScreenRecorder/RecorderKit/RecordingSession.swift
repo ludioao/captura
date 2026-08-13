@@ -89,6 +89,17 @@ actor RecordingSession {
             if configuration.externalDeviceID == nil {
                 interactionRecorder.start(displayFrame: details.displayFrame)
             }
+            try await projectStore.writeRecoveryManifest(
+                RecordingRecoveryManifest(
+                    createdAt: Date(),
+                    canvas: CanvasSize(width: details.outputWidth, height: details.outputHeight),
+                    sourceDisplay: CanvasSize(width: details.sourceWidth, height: details.sourceHeight),
+                    frameRate: configuration.frameRate,
+                    codec: configuration.codec,
+                    hasWebcam: configuration.captureWebcam
+                ),
+                to: package
+            )
             self.package = package
             self.configuration = configuration
             self.details = details

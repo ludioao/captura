@@ -439,7 +439,12 @@ struct EditorView: View {
             Divider()
             switch inspectorSection {
             case .canvas:
-                CanvasAppearanceInspector(appearance: appearanceBinding, hasCamera: playback.cameraPlayer != nil)
+                CanvasAppearanceInspector(
+                    appearance: appearanceBinding,
+                    audio: audioBinding,
+                    cursor: cursorBinding,
+                    hasCamera: playback.cameraPlayer != nil
+                )
             case .audio:
                 AudioInspector(settings: audioBinding)
             case .cursor:

@@ -92,8 +92,8 @@ Acceptance:
 
 Outcome: users can create branded, reusable templates and more complex demos.
 
-- Presets for canvas, camera, cursor, zoom and export settings.
-- Import/export of shareable preset files.
+- [x] Project presets for canvas, camera, cursor, audio and export settings.
+- [x] Import/export of shareable `.capturapreset` files.
 - Dynamic webcam layouts: hidden, picture-in-picture and fullscreen ranges.
 - [x] Timed privacy and highlight masks for sensitive or important areas.
 - [ ] True Gaussian blur masks in the Metal compositor.
@@ -112,7 +112,7 @@ Outcome: Captura covers device demos and fast sharing workflows.
 - [x] Optional free, 16:9, 1:1 and 9:16 aspect locking while selecting the area.
 - Batch export and copy exported media/current frame to clipboard.
 - Optional shareable links behind a separate, privacy-explicit service boundary.
-- Crash-safe recording recovery and autosave snapshots.
+- [x] Fragmented recording media, recovery manifests and automatic interrupted-project recovery.
 
 ## Not in scope for feature parity
 

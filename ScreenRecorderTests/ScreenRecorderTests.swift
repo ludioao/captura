@@ -311,7 +311,9 @@ final class ScreenRecorderTests: XCTestCase {
     func testMP4ExporterProducesRequestedCanvas() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         let mediaDirectory = directory.appending(path: "media", directoryHint: .isDirectory)
+        let metadataDirectory = directory.appending(path: "metadata", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = mediaDirectory.appending(path: "screen.mov")
         let destination = directory.appending(path: "export.mp4")
@@ -320,6 +322,9 @@ final class ScreenRecorderTests: XCTestCase {
         var project = sampleProject(duration: 1)
         project.settings.canvas = CanvasSize(width: 320, height: 180)
         project.settings.appearance = .default
+        project.settings.audio = ProjectAudioSettings(clickSounds: true, clickVolume: 0.7)
+        let click = InteractionEvent(type: .click, timestamp: 0.35, normalizedX: 0.5, normalizedY: 0.5)
+        try JSONEncoder().encode([click]).write(to: metadataDirectory.appending(path: "events.json"))
         try await MP4ProjectExporter().export(
             project: project,
             packageURL: directory,
@@ -330,12 +335,18 @@ final class ScreenRecorderTests: XCTestCase {
 
         let asset = AVURLAsset(url: destination)
         let tracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         let track = try XCTUnwrap(tracks.first)
         let naturalSize = try await track.load(.naturalSize)
         let duration = try await asset.load(.duration).seconds
         XCTAssertEqual(naturalSize, CGSize(width: 640, height: 360))
         XCTAssertEqual(duration, 1, accuracy: 0.08)
+        XCTAssertFalse(audioTracks.isEmpty)
         XCTAssertGreaterThan((try FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0, 1_000)
+    }
+
+    func testVoiceProcessingTapCanBeCreated() throws {
+        _ = try VoiceProcessingAudioTap.make(voiceEnhancement: true, noiseReduction: true)
     }
 
     func testGIFExporterProducesAnimatedImage() async throws {

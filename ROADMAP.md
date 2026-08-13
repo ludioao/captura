@@ -61,7 +61,7 @@ Outcome: raw recordings automatically become easy-to-follow demos.
 - [x] Smoothed cursor path, post-recording cursor sizing and static-cursor hiding.
 - High-resolution replacement for known macOS cursor types.
 - [x] Click ripple/circle effects.
-- [ ] Optional click sound effects.
+- [x] Optional synthesized click sound effects with adjustable level.
 - Cursor-aware webcam avoidance.
 
 Acceptance:
@@ -75,7 +75,7 @@ Acceptance:
 Outcome: tutorials sound clean and remain understandable without audio.
 
 - [x] Per-source mute and volume controls with visible waveforms.
-- Voice normalization and local noise reduction.
+- [x] Non-destructive voice enhancement and local noise-gate reduction during export.
 - Stereo microphone support and channel routing.
 - [x] Manual editable subtitle track with preview/export rendering.
 - [x] On-device transcript generation requested explicitly from the captions inspector.

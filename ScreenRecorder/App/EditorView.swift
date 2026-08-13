@@ -881,6 +881,14 @@ private struct AudioInspector: View {
                     Text("Volume")
                 } minimumValueLabel: { Image(systemName: "mic") } maximumValueLabel: { Image(systemName: "mic.fill") }
                     .disabled(settings.microphoneMuted)
+                Toggle("Voice enhancement", isOn: $settings.voiceEnhancement)
+                Toggle("Reduce background noise", isOn: $settings.noiseReduction)
+            }
+            Section("Click sound") {
+                Toggle("Add click sounds", isOn: $settings.clickSounds)
+                LabeledContent("Level", value: "\(Int(settings.clickVolume * 100))%")
+                Slider(value: $settings.clickVolume, in: 0...1)
+                    .disabled(!settings.clickSounds)
             }
             Text("Tracks remain independent and source media is never modified.")
                 .font(.caption)

@@ -94,6 +94,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             events: events,
             settings: settings
         )
+        defer { prepared.temporaryFiles.forEach { try? FileManager.default.removeItem(at: $0) } }
 
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
@@ -162,6 +163,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         let composition: AVMutableComposition
         let videoComposition: AVMutableVideoComposition
         let audioMix: AVAudioMix?
+        let temporaryFiles: [URL]
     }
 
     private func makeComposition(
@@ -225,6 +227,35 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         }
         guard destinationCursor > .zero else {
             throw ExportError.compositionFailed("The timeline has no exportable video.")
+        }
+
+        var clickTracks: [AVMutableCompositionTrack] = []
+        var clickURL: URL?
+        let audioSettings = project.settings.audio ?? .default
+        if audioSettings.clickSounds {
+            let url = try ClickSoundAsset.makeTemporary()
+            clickURL = url
+            let clickAsset = AVURLAsset(url: url)
+            if let clickSource = try await clickAsset.loadTracks(withMediaType: .audio).first {
+                let clickRange = try await clickSource.load(.timeRange)
+                var voiceEnds = Array(repeating: CMTime.zero, count: 4)
+                for event in events where event.type == .click {
+                    guard let timelineTime = project.timeline.firstTimelineTime(forSourceTime: event.timestamp),
+                          timelineTime < destinationCursor.seconds else { continue }
+                    let start = CMTime(seconds: timelineTime, preferredTimescale: 48_000)
+                    let voice = voiceEnds.indices.first(where: { voiceEnds[$0] <= start }) ?? 0
+                    while clickTracks.count <= voice {
+                        guard let track = composition.addMutableTrack(
+                            withMediaType: .audio,
+                            preferredTrackID: kCMPersistentTrackID_Invalid
+                        ) else { break }
+                        clickTracks.append(track)
+                    }
+                    guard voice < clickTracks.count else { continue }
+                    try clickTracks[voice].insertTimeRange(clickRange, of: clickSource, at: start)
+                    voiceEnds[voice] = CMTimeAdd(start, clickRange.duration)
+                }
+            }
         }
 
         let outputSize = CGSize(width: settings.resolution.width, height: settings.resolution.height)
@@ -304,15 +335,25 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             duration: destinationCursor.seconds
         )
 
-        let audioSettings = project.settings.audio ?? .default
-        let mixParameters = audioTracks.enumerated().map { index, track in
+        var mixParameters = try audioTracks.enumerated().map { index, track in
             let parameters = AVMutableAudioMixInputParameters(track: track)
             let isSystemAudio = index == 0
             let muted = isSystemAudio ? audioSettings.systemMuted : audioSettings.microphoneMuted
             let volume = isSystemAudio ? audioSettings.systemVolume : audioSettings.microphoneVolume
             parameters.setVolume(muted ? 0 : Float(volume), at: .zero)
+            if !isSystemAudio && (audioSettings.voiceEnhancement || audioSettings.noiseReduction) {
+                parameters.audioTapProcessor = try VoiceProcessingAudioTap.make(
+                    voiceEnhancement: audioSettings.voiceEnhancement,
+                    noiseReduction: audioSettings.noiseReduction
+                )
+            }
             return parameters
         }
+        mixParameters.append(contentsOf: clickTracks.map { track in
+            let parameters = AVMutableAudioMixInputParameters(track: track)
+            parameters.setVolume(Float(audioSettings.clickVolume), at: .zero)
+            return parameters
+        })
         let audioMix: AVAudioMix?
         if mixParameters.isEmpty {
             audioMix = nil
@@ -321,7 +362,12 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             mutableMix.inputParameters = mixParameters
             audioMix = mutableMix
         }
-        return PreparedComposition(composition: composition, videoComposition: videoComposition, audioMix: audioMix)
+        return PreparedComposition(
+            composition: composition,
+            videoComposition: videoComposition,
+            audioMix: audioMix,
+            temporaryFiles: clickURL.map { [$0] } ?? []
+        )
     }
 
     private func aspectFitTransform(

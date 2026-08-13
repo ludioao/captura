@@ -22,6 +22,7 @@ final class AppModel: ObservableObject {
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
     @Published var captureRegionNormalized = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+    @Published var areaAspectLock: AreaAspectLock = .free
     @Published var selectedMicrophoneID: String?
     @Published var selectedCameraID: String?
     @Published var selectedExternalDeviceID: String?

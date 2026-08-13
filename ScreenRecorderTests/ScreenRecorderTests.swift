@@ -209,6 +209,25 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(output.height, 1080)
     }
 
+    func testAreaSelectionLocksAspectAndStaysInsideCanvas() {
+        let canvas = CGSize(width: 1600, height: 900)
+        let selection = AreaSelectionGeometry.normalizedRect(
+            start: CGPoint(x: 1500, y: 800),
+            current: CGPoint(x: 200, y: 100),
+            canvasSize: canvas,
+            aspectRatio: 16 / 9
+        )
+
+        XCTAssertGreaterThan(selection.width, 0)
+        XCTAssertGreaterThan(selection.height, 0)
+        XCTAssertGreaterThanOrEqual(selection.minX, 0)
+        XCTAssertGreaterThanOrEqual(selection.minY, 0)
+        XCTAssertLessThanOrEqual(selection.maxX, 1)
+        XCTAssertLessThanOrEqual(selection.maxY, 1)
+        let pixelAspect = (selection.width * canvas.width) / (selection.height * canvas.height)
+        XCTAssertEqual(pixelAspect, 16 / 9, accuracy: 0.001)
+    }
+
     func testExternalDeviceDiscoveryHasStableUniqueIDs() {
         let devices = ExternalDeviceCaptureEngine.availableDevices()
         XCTAssertEqual(Set(devices.map(\.id)).count, devices.count)

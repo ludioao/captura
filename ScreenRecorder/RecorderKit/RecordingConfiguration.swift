@@ -60,6 +60,72 @@ enum CaptureSourceKind: String, CaseIterable, Sendable {
     case device = "Device"
 }
 
+enum AreaAspectLock: String, CaseIterable, Sendable {
+    case free = "Free"
+    case landscape = "16:9"
+    case square = "1:1"
+    case portrait = "9:16"
+
+    var ratio: CGFloat? {
+        switch self {
+        case .free: nil
+        case .landscape: 16 / 9
+        case .square: 1
+        case .portrait: 9 / 16
+        }
+    }
+}
+
+enum AreaSelectionGeometry {
+    static func normalizedRect(
+        start: CGPoint,
+        current: CGPoint,
+        canvasSize: CGSize,
+        aspectRatio: CGFloat?
+    ) -> CGRect {
+        guard canvasSize.width > 0, canvasSize.height > 0 else { return .zero }
+
+        let origin = CGPoint(
+            x: min(max(start.x, 0), canvasSize.width),
+            y: min(max(start.y, 0), canvasSize.height)
+        )
+        let target = CGPoint(
+            x: min(max(current.x, 0), canvasSize.width),
+            y: min(max(current.y, 0), canvasSize.height)
+        )
+        let directionX: CGFloat = target.x < origin.x ? -1 : 1
+        let directionY: CGFloat = target.y < origin.y ? -1 : 1
+        var width = max(abs(target.x - origin.x), 2)
+        var height = max(abs(target.y - origin.y), 2)
+
+        if let aspectRatio {
+            if width / height > aspectRatio {
+                height = width / aspectRatio
+            } else {
+                width = height * aspectRatio
+            }
+
+            let availableWidth = directionX > 0 ? canvasSize.width - origin.x : origin.x
+            let availableHeight = directionY > 0 ? canvasSize.height - origin.y : origin.y
+            let scale = min(1, availableWidth / width, availableHeight / height)
+            width *= max(scale, 0)
+            height *= max(scale, 0)
+        }
+
+        width = min(width, directionX > 0 ? canvasSize.width - origin.x : origin.x)
+        height = min(height, directionY > 0 ? canvasSize.height - origin.y : origin.y)
+        let x = directionX > 0 ? origin.x : origin.x - width
+        let y = directionY > 0 ? origin.y : origin.y - height
+
+        return CGRect(
+            x: x / canvasSize.width,
+            y: y / canvasSize.height,
+            width: width / canvasSize.width,
+            height: height / canvasSize.height
+        )
+    }
+}
+
 struct DisplayChoice: Identifiable, Hashable, Sendable {
     let id: CGDirectDisplayID
     let name: String

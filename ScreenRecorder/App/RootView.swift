@@ -117,7 +117,7 @@ private struct HomeView: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
 
-                if let sourceStatusMessage = model.sourceStatusMessage {
+                if let sourceStatusMessage = model.sourceStatusMessage, model.sourceKind != .device {
                     VStack(alignment: .leading, spacing: 8) {
                         Label(sourceStatusMessage, systemImage: "exclamationmark.triangle.fill")
                             .font(.callout)
@@ -133,9 +133,19 @@ private struct HomeView: View {
                         .buttonStyle(.link)
                     }
                 } else if model.sourceKind == .display || model.sourceKind == .area {
-                    Picker("Display", selection: $model.selectedDisplayID) {
-                        ForEach(model.displays) { display in
-                            Text("\(display.name) — \(display.width)×\(display.height)").tag(Optional(display.id))
+                    VStack(spacing: 10) {
+                        Picker("Display", selection: $model.selectedDisplayID) {
+                            ForEach(model.displays) { display in
+                                Text("\(display.name) — \(display.width)×\(display.height)").tag(Optional(display.id))
+                            }
+                        }
+                        if model.sourceKind == .area {
+                            Picker("Area aspect", selection: $model.areaAspectLock) {
+                                ForEach(AreaAspectLock.allCases, id: \.self) { lock in
+                                    Text(lock.rawValue).tag(lock)
+                                }
+                            }
+                            .pickerStyle(.segmented)
                         }
                     }
                 } else if model.sourceKind == .window {
@@ -210,10 +220,10 @@ private struct HomeView: View {
 
             HStack(spacing: 10) {
                 Circle().fill(permissionColor).frame(width: 7, height: 7)
-                Text(model.permissionSnapshot.screenRecording == .granted ? "Screen access granted" : "Screen access required")
+                Text(permissionStatusText)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if model.permissionSnapshot.screenRecording != .granted {
+                if model.sourceKind != .device && model.permissionSnapshot.screenRecording != .granted {
                     Button("Grant Access") { Task { await model.requestScreenPermission() } }
                         .buttonStyle(.link)
                 }
@@ -271,10 +281,13 @@ private struct HomeView: View {
                     .foregroundStyle(.white.opacity(0.7))
                 }
                 if model.sourceKind == .area, model.sourcePreview != nil {
-                    AreaSelectionOverlay(rect: $model.captureRegionNormalized)
+                    AreaSelectionOverlay(
+                        rect: $model.captureRegionNormalized,
+                        aspectRatio: model.areaAspectLock.ratio
+                    )
                 }
             }
-            .aspectRatio(16 / 9, contentMode: .fit)
+            .aspectRatio(sourcePreviewAspectRatio, contentMode: .fit)
 
             HStack(spacing: 8) {
                 Image(systemName: sourceIcon(model.sourceKind))
@@ -348,12 +361,28 @@ private struct HomeView: View {
     }
 
     private var permissionColor: Color {
-        model.permissionSnapshot.screenRecording == .granted ? .green : .orange
+        if model.sourceKind == .device {
+            return model.selectedExternalDeviceID == nil ? .orange : .green
+        }
+        return model.permissionSnapshot.screenRecording == .granted ? .green : .orange
+    }
+
+    private var permissionStatusText: String {
+        if model.sourceKind == .device {
+            return model.selectedExternalDeviceID == nil ? "Connect a capture device" : "Device ready"
+        }
+        return model.permissionSnapshot.screenRecording == .granted ? "Screen access granted" : "Screen access required"
+    }
+
+    private var sourcePreviewAspectRatio: CGFloat {
+        guard let image = model.sourcePreview, image.size.height > 0 else { return 16 / 9 }
+        return image.size.width / image.size.height
     }
 }
 
 private struct AreaSelectionOverlay: View {
     @Binding var rect: CGRect
+    let aspectRatio: CGFloat?
     @State private var dragStart: CGPoint?
 
     var body: some View {
@@ -387,15 +416,11 @@ private struct AreaSelectionOverlay: View {
                 .onChanged { value in
                     if dragStart == nil { dragStart = value.startLocation }
                     guard let start = dragStart else { return }
-                    let minX = min(start.x, value.location.x) / max(proxy.size.width, 1)
-                    let minY = min(start.y, value.location.y) / max(proxy.size.height, 1)
-                    let width = abs(value.location.x - start.x) / max(proxy.size.width, 1)
-                    let height = abs(value.location.y - start.y) / max(proxy.size.height, 1)
-                    rect = CGRect(
-                        x: min(max(minX, 0), 0.98),
-                        y: min(max(minY, 0), 0.98),
-                        width: min(max(width, 0.02), 1 - minX),
-                        height: min(max(height, 0.02), 1 - minY)
+                    rect = AreaSelectionGeometry.normalizedRect(
+                        start: start,
+                        current: value.location,
+                        canvasSize: proxy.size,
+                        aspectRatio: aspectRatio
                     )
                 }
                 .onEnded { _ in dragStart = nil }

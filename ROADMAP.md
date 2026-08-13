@@ -109,7 +109,7 @@ Outcome: Captura covers device demos and fast sharing workflows.
 - [ ] Device model/color/orientation metadata and hardware validation across iPhone/iPad generations.
 - iPhone/iPad frames and colors.
 - [x] Area capture with interactive preview guides.
-- [ ] Optional aspect locking while selecting the area.
+- [x] Optional free, 16:9, 1:1 and 9:16 aspect locking while selecting the area.
 - Batch export and copy exported media/current frame to clipboard.
 - Optional shareable links behind a separate, privacy-explicit service boundary.
 - Crash-safe recording recovery and autosave snapshots.

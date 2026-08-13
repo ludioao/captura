@@ -298,6 +298,47 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertNotEqual(data.assumingMemoryBound(to: UInt8.self)[0], 0)
     }
 
+    func testMetalProjectRendererComposesCanvasCameraAndPrivacyBlur() throws {
+        let source = try makeMetalPixelBuffer(width: 96, height: 54, value: 0x68)
+        let camera = try makeMetalPixelBuffer(width: 48, height: 48, value: 0xD2)
+        let destination = try makeMetalPixelBuffer(width: 192, height: 108, value: 0)
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 96, height: 54)
+        project.settings.appearance = .default
+        project.overlays = [OverlayRegion(
+            startTime: 0, endTime: 1,
+            normalizedX: 0.5, normalizedY: 0.5,
+            normalizedWidth: 0.3, normalizedHeight: 0.3,
+            kind: .privacy
+        )]
+        let geometry = ExportGeometry(
+            outputSize: CGSize(width: 192, height: 108),
+            sourceSize: project.settings.canvas,
+            appearance: .default
+        )
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 1, preferredTimescale: 600)),
+            screenTrackID: 1,
+            cameraTrackID: 2,
+            project: project,
+            events: [],
+            geometry: geometry
+        )
+
+        try MetalProjectRenderer().render(
+            source: source,
+            camera: camera,
+            destination: destination,
+            compositionTime: CMTime(seconds: 0.5, preferredTimescale: 600),
+            instruction: instruction
+        )
+
+        CVPixelBufferLockBaseAddress(destination, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+        let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
+        XCTAssertNotEqual(bytes[0], bytes[CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4])
+    }
+
     func testLegacyTimelineClipDefaultsToNormalSpeed() throws {
         let id = UUID()
         let mediaID = UUID()

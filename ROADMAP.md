@@ -35,14 +35,14 @@ Reference reviewed: <https://screen.studio/> and its public changelog on 2026-08
 
 Outcome: a user records, edits and exports a polished MP4 without leaving Captura.
 
-- Metal-backed compositor for background, padding, shadow, window chrome, crop and webcam.
+- [x] Metal-backed export compositor for background, padding, shadow, window chrome, crop and webcam.
 - [x] H.264 and HEVC MP4 export with source, 1080p and 4K presets.
 - [x] Real timeline split, ripple delete, start/end trim and per-slice speed controls.
 - [x] Horizontal 16:9, square 1:1, portrait 9:16 and social 4:5 output.
 - [x] Export status, cancellation and actionable failures.
 - [x] Continuous export progress and disk-space preflight.
 - [x] Metal frame core, texture cache, shader pipeline and IOSurface output.
-- [ ] Route the complete canvas/webcam/effect graph through Metal for pixel-perfect preview/export parity.
+- [ ] Route the live editor player through the shared Metal graph; export now uses it end-to-end.
 - [x] Quick export using the last successful settings with collision-safe filenames.
 
 Acceptance:
@@ -96,7 +96,7 @@ Outcome: users can create branded, reusable templates and more complex demos.
 - [x] Import/export of shareable `.capturapreset` files.
 - Dynamic webcam layouts: hidden, picture-in-picture and fullscreen ranges.
 - [x] Timed privacy and highlight masks for sensitive or important areas.
-- [ ] True Gaussian blur masks in the Metal compositor.
+- [x] True 5×5 Gaussian blur masks sampled in the Metal compositor.
 - Custom cursor packs and additional macOS/device frames.
 - [x] Import existing MOV/MP4 files into a project.
 - [x] GIF export with scale, FPS, quality and infinite loop.

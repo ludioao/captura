@@ -262,76 +262,24 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         let appearance = project.settings.appearance ?? .default
         let geometry = ExportGeometry(outputSize: outputSize, sourceSize: project.settings.canvas, appearance: appearance)
 
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: destinationCursor)
-        instruction.backgroundColor = NSColor.clear.cgColor
-
-        var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-        let screenInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: screenTrack)
-        let screenNaturalSize = try await screenSource.load(.naturalSize)
-        let screenPreferredTransform = try await screenSource.load(.preferredTransform)
-        screenInstruction.setTransform(
-            aspectFitTransform(
-                naturalSize: screenNaturalSize,
-                preferredTransform: screenPreferredTransform,
-                destination: geometry.screenRect
-            ),
-            at: .zero
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: destinationCursor),
+            screenTrackID: screenTrack.trackID,
+            cameraTrackID: cameraTrack?.trackID,
+            project: project,
+            events: events,
+            geometry: geometry
         )
-        let zoomFrames = project.cameraKeyframes.compactMap { frame -> (Double, CameraKeyframe)? in
-            guard let time = project.timeline.firstTimelineTime(forSourceTime: frame.time) else { return nil }
-            return (time, frame)
-        }.sorted { $0.0 < $1.0 }
-        var previousTime = 0.0
-        var previousTransform = aspectFitTransform(
-            naturalSize: screenNaturalSize,
-            preferredTransform: screenPreferredTransform,
-            destination: geometry.screenRect
-        )
-        for (time, frame) in zoomFrames where time > previousTime {
-            let nextTransform = aspectFitTransform(
-                naturalSize: screenNaturalSize,
-                preferredTransform: screenPreferredTransform,
-                destination: zoomDestination(for: frame, screenRect: geometry.screenRect)
-            )
-            screenInstruction.setTransformRamp(
-                fromStart: previousTransform,
-                toEnd: nextTransform,
-                timeRange: CMTimeRange(
-                    start: CMTime(seconds: previousTime, preferredTimescale: 600),
-                    end: CMTime(seconds: min(time, destinationCursor.seconds), preferredTimescale: 600)
-                )
-            )
-            previousTime = time
-            previousTransform = nextTransform
-        }
-        screenInstruction.setTransform(previousTransform, at: CMTime(seconds: previousTime, preferredTimescale: 600))
-        layerInstructions.append(screenInstruction)
-
-        if let cameraSource, let cameraTrack {
-            let cameraInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: cameraTrack)
-            cameraInstruction.setTransform(
-                aspectFillTransform(
-                    naturalSize: try await cameraSource.load(.naturalSize),
-                    preferredTransform: try await cameraSource.load(.preferredTransform),
-                    destination: geometry.cameraRect
-                ),
-                at: .zero
-            )
-            layerInstructions.insert(cameraInstruction, at: 0)
-        }
-        instruction.layerInstructions = layerInstructions
 
         let videoComposition = AVMutableVideoComposition()
         videoComposition.instructions = [instruction]
+        videoComposition.customVideoCompositorClass = MetalProjectVideoCompositor.self
         videoComposition.renderSize = outputSize
         videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, settings.fps)))
         videoComposition.renderScale = 1
-        videoComposition.animationTool = makeAnimationTool(
+        videoComposition.animationTool = makeCaptionAnimationTool(
             geometry: geometry,
-            appearance: appearance,
-            project: project,
-            events: events,
+            cues: project.captions ?? [],
             duration: destinationCursor.seconds
         )
 
@@ -368,6 +316,22 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             audioMix: audioMix,
             temporaryFiles: clickURL.map { [$0] } ?? []
         )
+    }
+
+    private func makeCaptionAnimationTool(
+        geometry: ExportGeometry,
+        cues: [CaptionCue],
+        duration: Double
+    ) -> AVVideoCompositionCoreAnimationTool? {
+        guard !cues.isEmpty else { return nil }
+        let root = CALayer()
+        root.frame = CGRect(origin: .zero, size: geometry.outputSize)
+        root.isGeometryFlipped = true
+        let video = CALayer()
+        video.frame = root.bounds
+        root.addSublayer(video)
+        addCaptions(to: root, geometry: geometry, cues: cues, duration: duration)
+        return AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: video, in: root)
     }
 
     private func aspectFitTransform(
@@ -705,7 +669,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
     }
 }
 
-private struct ExportGeometry {
+struct ExportGeometry: Sendable {
     let outputSize: CGSize
     let windowRect: CGRect
     let screenRect: CGRect

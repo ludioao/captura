@@ -101,6 +101,35 @@ struct ProjectSettings: Codable, Hashable, Sendable {
     var codec: VideoCodec
     /// Optional so projects created before canvas styling continue to decode.
     var appearance: CanvasAppearance? = nil
+    /// Optional fields keep projects from earlier builds source-compatible.
+    var audio: ProjectAudioSettings? = nil
+    var cursor: CursorAppearance? = nil
+}
+
+struct ProjectAudioSettings: Codable, Hashable, Sendable {
+    var systemVolume = 1.0
+    var microphoneVolume = 1.0
+    var systemMuted = false
+    var microphoneMuted = false
+
+    static let `default` = ProjectAudioSettings()
+}
+
+struct CursorAppearance: Codable, Hashable, Sendable {
+    var isVisible = true
+    var size = 1.0
+    var smoothing = 0.35
+    var hidesWhenIdle = true
+    var clickEffect = true
+
+    static let `default` = CursorAppearance()
+}
+
+struct CaptionCue: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var startTime: Double
+    var endTime: Double
+    var text: String
 }
 
 struct RecordingMetadata: Codable, Hashable, Sendable {
@@ -121,6 +150,7 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var recording: RecordingMetadata
     var cameraKeyframes: [CameraKeyframe]
     var timeline: Timeline
+    var captions: [CaptionCue]? = nil
 }
 
 struct RecentProject: Identifiable, Hashable, Sendable {

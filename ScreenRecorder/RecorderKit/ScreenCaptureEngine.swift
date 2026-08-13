@@ -46,6 +46,7 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
     func start(
         configuration: RecordingConfiguration,
         outputURL: URL,
+        timeline: CaptureTimeline,
         failureHandler: @escaping @Sendable (RecorderError) -> Void
     ) async throws -> CaptureDetails {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -93,7 +94,8 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             frameRate: configuration.frameRate,
             codec: configuration.codec,
             includesSystemAudio: configuration.captureSystemAudio,
-            includesMicrophone: configuration.captureMicrophone
+            includesMicrophone: configuration.captureMicrophone,
+            timeline: timeline
         )
         let stream = SCStream(filter: filter, configuration: streamConfiguration, delegate: self)
         do {
@@ -122,9 +124,6 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             outputHeight: output.height
         )
     }
-
-    func pause() { writer?.pause() }
-    func resume() { writer?.resume() }
 
     func stop() async throws -> RecordingMetrics {
         if let stream {

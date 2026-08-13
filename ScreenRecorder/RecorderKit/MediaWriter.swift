@@ -13,10 +13,8 @@ final class MediaWriter: @unchecked Sendable {
     private let videoInput: AVAssetWriterInput
     private let audioInput: AVAssetWriterInput?
     private let microphoneInput: AVAssetWriterInput?
+    private let timeline: CaptureTimeline
     private var hasStarted = false
-    private var isPaused = false
-    private var pauseStartedAt: CMTime?
-    private var accumulatedPause = CMTime.zero
     private var latestPresentationTime = CMTime.invalid
     private var firstPresentationTime = CMTime.invalid
     private var capturedFrames = 0
@@ -31,8 +29,10 @@ final class MediaWriter: @unchecked Sendable {
         frameRate: Int,
         codec: VideoCodec,
         includesSystemAudio: Bool,
-        includesMicrophone: Bool
+        includesMicrophone: Bool,
+        timeline: CaptureTimeline
     ) throws {
+        self.timeline = timeline
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
         } catch {
@@ -129,17 +129,6 @@ final class MediaWriter: @unchecked Sendable {
         }
     }
 
-    func pause() {
-        queue.async { [self] in
-            isPaused = true
-            pauseStartedAt = nil
-        }
-    }
-
-    func resume() {
-        queue.async { [self] in isPaused = false }
-    }
-
     func finish() async throws -> RecordingMetrics {
         try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
@@ -165,23 +154,17 @@ final class MediaWriter: @unchecked Sendable {
     private func append(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput, countsAsVideo: Bool) {
         let started = CFAbsoluteTimeGetCurrent()
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if isPaused {
-            if pauseStartedAt == nil { pauseStartedAt = presentationTime }
-            return
-        }
-        if let pauseStartedAt {
-            accumulatedPause = CMTimeAdd(accumulatedPause, CMTimeSubtract(presentationTime, pauseStartedAt))
-            self.pauseStartedAt = nil
-        }
+        if countsAsVideo { timeline.beginIfNeeded(at: presentationTime) }
+        guard let adjustment = timeline.adjustment(for: presentationTime) else { return }
 
-        guard ensureWritingStarted(at: presentationTime), input.isReadyForMoreMediaData else {
+        guard ensureWritingStarted(at: adjustment.origin), input.isReadyForMoreMediaData else {
             if countsAsVideo { droppedFrames += 1 }
             return
         }
         do {
-            let adjusted = try retimed(sampleBuffer, subtracting: accumulatedPause)
+            let adjusted = try retimed(sampleBuffer, subtracting: adjustment.pauseOffset)
             if input.append(adjusted) {
-                latestPresentationTime = CMTimeSubtract(presentationTime, accumulatedPause)
+                latestPresentationTime = CMTimeSubtract(presentationTime, adjustment.pauseOffset)
                 if countsAsVideo { encodedFrames += 1 }
             } else if countsAsVideo {
                 droppedFrames += 1

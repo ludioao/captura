@@ -1,4 +1,8 @@
 import CoreGraphics
+import CoreMedia
+import CoreVideo
+import AVFoundation
+import ImageIO
 import XCTest
 
 #if canImport(captura)
@@ -8,6 +12,35 @@ import XCTest
 #endif
 
 final class ScreenRecorderTests: XCTestCase {
+    func testCaptureTimelineUsesScreenOriginForEverySource() {
+        let timeline = CaptureTimeline()
+        let origin = CMTime(seconds: 100, preferredTimescale: 1_000)
+
+        XCTAssertNil(timeline.adjustment(for: CMTime(seconds: 99, preferredTimescale: 1_000)))
+        timeline.beginIfNeeded(at: origin)
+
+        let camera = timeline.adjustment(for: CMTime(seconds: 101.3, preferredTimescale: 1_000))
+        XCTAssertEqual(camera?.origin, origin)
+        XCTAssertEqual(camera?.pauseOffset, .zero)
+    }
+
+    func testCaptureTimelineAppliesOnePauseOffsetToAudioAndCamera() {
+        let timeline = CaptureTimeline()
+        timeline.beginIfNeeded(at: CMTime(seconds: 10, preferredTimescale: 1_000))
+        timeline.pause(at: CMTime(seconds: 12, preferredTimescale: 1_000))
+
+        XCTAssertNil(timeline.adjustment(for: CMTime(seconds: 12.5, preferredTimescale: 1_000)))
+
+        timeline.resume(at: CMTime(seconds: 15, preferredTimescale: 1_000))
+        let screen = timeline.adjustment(for: CMTime(seconds: 16, preferredTimescale: 1_000))
+        let camera = timeline.adjustment(for: CMTime(seconds: 16.03, preferredTimescale: 1_000))
+
+        XCTAssertNotNil(screen)
+        XCTAssertNotNil(camera)
+        XCTAssertEqual(screen!.pauseOffset.seconds, 3, accuracy: 0.001)
+        XCTAssertEqual(camera!.pauseOffset.seconds, 3, accuracy: 0.001)
+    }
+
     func testProjectSerializationRoundTrip() throws {
         let project = sampleProject(duration: 12.5)
         let encoder = JSONEncoder()
@@ -145,6 +178,111 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(timeline.duration, 10)
     }
 
+    func testTimelineSpeedChangesDurationAndSplitSourcePosition() throws {
+        let clip = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 10, sourceEnd: 30,
+            timelineStart: 0, speed: 2
+        )
+        let halves = try XCTUnwrap(clip.split(at: 4))
+
+        XCTAssertEqual(clip.duration, 10)
+        XCTAssertEqual(halves.0.sourceEnd, 18)
+        XCTAssertEqual(halves.0.duration, 4)
+        XCTAssertEqual(halves.1.timelineStart, 4)
+    }
+
+    func testTimelineMapsEditedTimeToSourceAndBack() {
+        let clip = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 8, sourceEnd: 18,
+            timelineStart: 3, speed: 2
+        )
+        let timeline = Timeline(clips: [clip])
+
+        XCTAssertEqual(timeline.sourceTime(at: 5), 12)
+        XCTAssertEqual(timeline.firstTimelineTime(forSourceTime: 16), 7)
+        XCTAssertNil(timeline.sourceTime(at: 1))
+    }
+
+    func testCameraKeyframesInterpolateSmoothly() throws {
+        let frames = [
+            CameraKeyframe(time: 0, centerX: 0.2, centerY: 0.3, scale: 1, easing: .linear),
+            CameraKeyframe(time: 2, centerX: 0.8, centerY: 0.7, scale: 2, easing: .linear)
+        ]
+        let value = try XCTUnwrap(CameraKeyframeInterpolator().value(at: 1, frames: frames))
+
+        XCTAssertEqual(value.centerX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(value.centerY, 0.5, accuracy: 0.001)
+        XCTAssertEqual(value.scale, 1.5, accuracy: 0.001)
+    }
+
+    func testLegacyTimelineClipDefaultsToNormalSpeed() throws {
+        let id = UUID()
+        let mediaID = UUID()
+        let data = Data(#"{"id":"\#(id.uuidString)","sourceMediaID":"\#(mediaID.uuidString)","sourceStart":0,"sourceEnd":5,"timelineStart":0}"#.utf8)
+        let clip = try JSONDecoder().decode(TimelineClip.self, from: data)
+
+        XCTAssertEqual(clip.speed, 1)
+        XCTAssertEqual(clip.duration, 5)
+    }
+
+    func testMP4ExporterProducesRequestedCanvas() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let mediaDirectory = directory.appending(path: "media", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = mediaDirectory.appending(path: "screen.mov")
+        let destination = directory.appending(path: "export.mp4")
+        try await makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 30)
+
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 320, height: 180)
+        project.settings.appearance = .default
+        try await MP4ProjectExporter().export(
+            project: project,
+            packageURL: directory,
+            destination: destination,
+            settings: .mp4(resolution: CanvasSize(width: 640, height: 360), fps: 30),
+            progress: { _ in }
+        )
+
+        let asset = AVURLAsset(url: destination)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let naturalSize = try await track.load(.naturalSize)
+        let duration = try await asset.load(.duration).seconds
+        XCTAssertEqual(naturalSize, CGSize(width: 640, height: 360))
+        XCTAssertEqual(duration, 1, accuracy: 0.08)
+        XCTAssertGreaterThan((try FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0, 1_000)
+    }
+
+    func testGIFExporterProducesAnimatedImage() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let mediaDirectory = directory.appending(path: "media", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = mediaDirectory.appending(path: "screen.mov")
+        let destination = directory.appending(path: "export.gif")
+        try await makeTestMovie(at: source, size: CGSize(width: 160, height: 90), frameCount: 15)
+        var project = sampleProject(duration: 0.5)
+        project.settings.canvas = CanvasSize(width: 160, height: 90)
+        project.settings.cursor = .default
+        project.captions = [CaptionCue(startTime: 0, endTime: 0.4, text: "Captura")]
+
+        try await GIFExporter().export(
+            project: project,
+            packageURL: directory,
+            destination: destination,
+            settings: ExportSettings(
+                format: .gif, codec: .h264,
+                resolution: CanvasSize(width: 320, height: 180), fps: 5, quality: .high
+            ),
+            progress: { _ in }
+        )
+
+        let imageSource = try XCTUnwrap(CGImageSourceCreateWithURL(destination as CFURL, nil))
+        XCTAssertGreaterThanOrEqual(CGImageSourceGetCount(imageSource), 2)
+    }
+
     func testNearbyClicksAreGroupedIntoOneIntent() {
         let events = [
             InteractionEvent(type: .click, timestamp: 1, normalizedX: 0.4, normalizedY: 0.5),
@@ -189,5 +327,52 @@ final class ScreenRecorderTests: XCTestCase {
             cameraKeyframes: [],
             timeline: Timeline(clips: [TimelineClip(id: UUID(), sourceMediaID: mediaID, sourceStart: 0, sourceEnd: duration, timelineStart: 0)])
         )
+    }
+
+    private func makeTestMovie(at url: URL, size: CGSize, frameCount: Int) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: Int(size.width),
+                AVVideoHeightKey: Int(size.height)
+            ]
+        )
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height)
+            ]
+        )
+        XCTAssertTrue(writer.canAdd(input))
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+
+        for frame in 0..<frameCount {
+            while !input.isReadyForMoreMediaData { await Task.yield() }
+            var pixelBuffer: CVPixelBuffer?
+            let result = CVPixelBufferCreate(
+                kCFAllocatorDefault, Int(size.width), Int(size.height),
+                kCVPixelFormatType_32BGRA, nil, &pixelBuffer
+            )
+            guard result == kCVReturnSuccess, let pixelBuffer else {
+                throw NSError(domain: "CapturaTests", code: Int(result))
+            }
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                memset(base, frame % 2 == 0 ? 0x36 : 0x86, CVPixelBufferGetDataSize(pixelBuffer))
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            XCTAssertTrue(adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw writer.error ?? NSError(domain: "CapturaTests", code: -1)
+        }
     }
 }

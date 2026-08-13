@@ -4,3 +4,4 @@ DerivedData/
 *.xcresult
 *.xcuserstate
 xcuserdata/
+*.profraw

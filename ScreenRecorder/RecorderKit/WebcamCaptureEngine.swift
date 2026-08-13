@@ -14,12 +14,10 @@ final class WebcamCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferD
     var previewSession: AVCaptureSession { session }
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
+    private var timeline: CaptureTimeline?
     private var hasStartedWriting = false
-    private var isPaused = false
-    private var pauseStartedAt: CMTime?
-    private var accumulatedPause = CMTime.zero
 
-    func start(deviceID: String, outputURL: URL, frameRate: Int) async throws {
+    func start(deviceID: String, outputURL: URL, frameRate: Int, timeline: CaptureTimeline) async throws {
         try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 do {
@@ -72,6 +70,7 @@ final class WebcamCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferD
                     writer.add(writerInput)
                     self.writer = writer
                     self.writerInput = writerInput
+                    self.timeline = timeline
                     session.startRunning()
                     Log.capture.info("Webcam capture started using \(device.localizedName, privacy: .public)")
                     continuation.resume()
@@ -80,17 +79,6 @@ final class WebcamCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 }
             }
         }
-    }
-
-    func pause() {
-        queue.async { [self] in
-            isPaused = true
-            pauseStartedAt = nil
-        }
-    }
-
-    func resume() {
-        queue.async { [self] in isPaused = false }
     }
 
     func stop() async throws {
@@ -122,27 +110,20 @@ final class WebcamCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferD
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard sampleBuffer.isValid, let writer, let writerInput else { return }
+        guard sampleBuffer.isValid, let writer, let writerInput, let timeline else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if isPaused {
-            if pauseStartedAt == nil { pauseStartedAt = time }
-            return
-        }
-        if let pauseStartedAt {
-            accumulatedPause = CMTimeAdd(accumulatedPause, CMTimeSubtract(time, pauseStartedAt))
-            self.pauseStartedAt = nil
-        }
+        guard let adjustment = timeline.adjustment(for: time) else { return }
         if !hasStartedWriting {
             guard writer.startWriting() else {
                 Log.encoder.error("Webcam writer failed to start: \(writer.error?.localizedDescription ?? "unknown")")
                 return
             }
-            writer.startSession(atSourceTime: time)
+            writer.startSession(atSourceTime: adjustment.origin)
             hasStartedWriting = true
         }
         guard writerInput.isReadyForMoreMediaData else { return }
         do {
-            let adjusted = try retimed(sampleBuffer, subtracting: accumulatedPause)
+            let adjusted = try retimed(sampleBuffer, subtracting: adjustment.pauseOffset)
             if !writerInput.append(adjusted) {
                 Log.encoder.error("Webcam frame append failed: \(writer.error?.localizedDescription ?? "unknown")")
             }
@@ -180,10 +161,8 @@ final class WebcamCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private func reset() {
         writer = nil
         writerInput = nil
+        timeline = nil
         hasStartedWriting = false
-        isPaused = false
-        pauseStartedAt = nil
-        accumulatedPause = .zero
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
     }

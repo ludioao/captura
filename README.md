@@ -36,7 +36,7 @@ xcodebuild test -project ScreenRecorder.xcodeproj \
 
 `swift test` is also supported for model tests through `Package.swift`.
 
-For local interactive builds, use `scripts/install-local.sh`. It builds Release, signs with the installed Apple Development identity, installs to `/Applications/captura.app`, verifies the signature, and launches it. Do not install privacy-sensitive builds with `CODE_SIGNING_ALLOWED=NO` alone or replace this step with ad-hoc signing: macOS TCC may treat each binary hash as a different app and request permissions repeatedly.
+For local builds, use `scripts/install-local.sh`. It builds Release, signs with the installed Apple Development identity, installs to `/Applications/captura.app`, and verifies the signature without launching the app. Pass `--launch` only when an interactive test is explicitly wanted. Do not install privacy-sensitive builds with `CODE_SIGNING_ALLOWED=NO` alone or replace this step with ad-hoc signing: macOS TCC may treat each binary hash as a different app and request permissions repeatedly.
 
 ## Permissions
 
@@ -58,7 +58,7 @@ ScreenRecorder/
 ├── DirectorKit/     deterministic camera intents and keyframes
 ├── TimelineKit/     immutable-source clip/range editing model
 ├── RenderKit/       zero-copy compositor and cursor interfaces
-├── ExportKit/       exporter contracts and GIF placeholder
+├── ExportKit/       H.264/HEVC MP4 and animated GIF composition
 └── Shared/          OSLog and permission abstractions
 ```
 
@@ -66,13 +66,16 @@ Detailed design: [architecture](docs/ARCHITECTURE.md), [recording pipeline](docs
 
 ## Intentionally not implemented yet
 
+The feature-parity plan is tracked in [`ROADMAP.md`](ROADMAP.md).
+
 - Editable webcam position/keyframes and Metal composition (capture and basic editor overlay are implemented)
 - Metal preview/compositing implementation (the interface exists; preview currently uses AVPlayer)
 - Cursor asset capture and rendered cursor replacement
 - Undo and continuous autosave (explicit editor save is implemented)
-- MP4 render/export and GIF encoding
+- Metal custom compositor for effect-level preview/export parity
 - Full pause-aware audio validation under device changes
 - Thumbnails and real audio waveform analysis
 - App Store sandbox/document-type registration and production signing
 
-The exact next step is to add an independent microphone capture/writer track with a shared host-time clock, then validate drift, pause/resume, and device changes alongside ScreenCaptureKit system audio.
+The exact next step is the Metal compositor for pixel-identical preview/export,
+followed by transcript generation, privacy masks, device capture and reusable presets.

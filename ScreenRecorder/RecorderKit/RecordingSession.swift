@@ -9,6 +9,7 @@ actor RecordingSession {
     private var configuration: RecordingConfiguration?
     private var package: ProjectPackage?
     private var details: CaptureDetails?
+    private var timeline: CaptureTimeline?
     private var state: RecordingState = .idle
     private var observers: [UUID: AsyncStream<RecordingState>.Continuation] = [:]
 
@@ -40,13 +41,7 @@ actor RecordingSession {
         transition(to: .preparing)
         do {
             let package = try await projectStore.createPackage()
-            let details = try await captureEngine.start(
-                configuration: configuration,
-                outputURL: package.screenMediaURL,
-                failureHandler: { [weak self] error in
-                    Task { await self?.captureDidFail(error) }
-                }
-            )
+            let timeline = CaptureTimeline()
             if configuration.captureWebcam {
                 guard let webcamDeviceID = configuration.webcamDeviceID else {
                     _ = try? await captureEngine.stop()
@@ -56,17 +51,32 @@ actor RecordingSession {
                     try await webcamCaptureEngine.start(
                         deviceID: webcamDeviceID,
                         outputURL: package.cameraMediaURL,
-                        frameRate: min(configuration.frameRate, 30)
+                        frameRate: min(configuration.frameRate, 30),
+                        timeline: timeline
                     )
                 } catch {
-                    _ = try? await captureEngine.stop()
                     throw error
                 }
+            }
+            let details: CaptureDetails
+            do {
+                details = try await captureEngine.start(
+                    configuration: configuration,
+                    outputURL: package.screenMediaURL,
+                    timeline: timeline,
+                    failureHandler: { [weak self] error in
+                        Task { await self?.captureDidFail(error) }
+                    }
+                )
+            } catch {
+                if configuration.captureWebcam { try? await webcamCaptureEngine.stop() }
+                throw error
             }
             interactionRecorder.start(displayFrame: details.displayFrame)
             self.package = package
             self.configuration = configuration
             self.details = details
+            self.timeline = timeline
             transition(to: .recording)
         } catch let error as RecorderError {
             transition(to: .failed(error))
@@ -80,16 +90,14 @@ actor RecordingSession {
 
     func pause() throws {
         guard state == .recording else { throw RecorderError.invalidState }
-        captureEngine.pause()
-        if configuration?.captureWebcam == true { webcamCaptureEngine.pause() }
+        timeline?.pause()
         interactionRecorder.pause()
         transition(to: .paused)
     }
 
     func resume() throws {
         guard state == .paused else { throw RecorderError.invalidState }
-        captureEngine.resume()
-        if configuration?.captureWebcam == true { webcamCaptureEngine.resume() }
+        timeline?.resume()
         interactionRecorder.resume()
         transition(to: .recording)
     }
@@ -100,8 +108,7 @@ actor RecordingSession {
               let configuration,
               let details else { throw RecorderError.invalidState }
         if state == .paused {
-            captureEngine.resume()
-            if configuration.captureWebcam { webcamCaptureEngine.resume() }
+            timeline?.resume()
             interactionRecorder.resume()
         }
         transition(to: .stopping)
@@ -193,6 +200,7 @@ actor RecordingSession {
         configuration = nil
         package = nil
         details = nil
+        timeline = nil
     }
 
     private func isTerminal(_ state: RecordingState) -> Bool {

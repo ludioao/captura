@@ -8,6 +8,10 @@ struct CanvasMockupPreview: View {
     let sourceSize: CanvasSize
     @Binding var appearance: CanvasAppearance
     var allowsCameraDragging = true
+    var cursorSample: CursorSample? = nil
+    var cursorAppearance: CursorAppearance = .default
+    var caption: String? = nil
+    var cameraFrame: CameraKeyframe? = nil
     @State private var cameraDragOrigin: CGPoint?
     @State private var cameraResizeOrigin: CGSize?
 
@@ -31,9 +35,37 @@ struct CanvasMockupPreview: View {
                             ZStack {
                                 NativePlayerView(player: player)
                                     .background(.black)
+                                    .scaleEffect(max(1, cameraFrame?.scale ?? 1))
+                                    .offset(
+                                        x: (0.5 - (cameraFrame?.centerX ?? 0.5)) * contentProxy.size.width * max(0, (cameraFrame?.scale ?? 1) - 1),
+                                        y: (0.5 - (cameraFrame?.centerY ?? 0.5)) * contentProxy.size.height * max(0, (cameraFrame?.scale ?? 1) - 1)
+                                    )
 
                                 if let cameraPlayer {
                                     cameraOverlay(player: cameraPlayer, in: contentProxy.size)
+                                }
+
+                                if cursorAppearance.isVisible, let cursorSample {
+                                    Image(systemName: cursorSample.cursorType == .pointingHand ? "hand.point.up.left.fill" : "cursorarrow")
+                                        .font(.system(size: 22 * cursorAppearance.size, weight: .semibold))
+                                        .foregroundStyle(.white, .black)
+                                        .shadow(color: .black.opacity(0.65), radius: 1, x: 1, y: 1)
+                                        .position(
+                                            x: contentProxy.size.width * cursorSample.normalizedX,
+                                            y: contentProxy.size.height * cursorSample.normalizedY
+                                        )
+                                }
+
+                                if let caption, !caption.isEmpty {
+                                    Text(caption)
+                                        .font(.system(size: max(14, contentProxy.size.width * 0.026), weight: .semibold))
+                                        .foregroundStyle(.white)
+                                        .multilineTextAlignment(.center)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 9)
+                                        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
+                                        .frame(maxWidth: contentProxy.size.width * 0.82)
+                                        .position(x: contentProxy.size.width / 2, y: contentProxy.size.height * 0.88)
                                 }
                             }
                         }
@@ -212,12 +244,36 @@ private struct CameraResizeHandle: View {
 struct CanvasAppearanceInspector: View {
     @Binding var appearance: CanvasAppearance
     let hasCamera: Bool
+    @State private var savedPresets = CanvasPresetStore.load()
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Canvas")
                     .font(.title3.weight(.semibold))
+
+                HStack {
+                    Menu("Presets") {
+                        Button("Captura Default") { appearance = .default }
+                        ForEach(savedPresets) { preset in
+                            Button(preset.name) { appearance = preset.appearance }
+                        }
+                        if !savedPresets.isEmpty {
+                            Divider()
+                            Button("Clear saved presets", role: .destructive) {
+                                savedPresets = []
+                                CanvasPresetStore.save(savedPresets)
+                            }
+                        }
+                    }
+                    Button("Save current") {
+                        savedPresets.append(SavedCanvasPreset(
+                            name: "Preset \(savedPresets.count + 1)",
+                            appearance: appearance
+                        ))
+                        CanvasPresetStore.save(savedPresets)
+                    }
+                }
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Background").font(.headline)
@@ -370,6 +426,23 @@ struct CanvasAppearanceInspector: View {
                 appearance.backgroundPreset = .custom
             }
         )
+    }
+}
+
+private struct SavedCanvasPreset: Codable, Identifiable {
+    var id = UUID()
+    var name: String
+    var appearance: CanvasAppearance
+}
+
+private enum CanvasPresetStore {
+    private static let key = "captura.canvasPresets"
+    static func load() -> [SavedCanvasPreset] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([SavedCanvasPreset].self, from: data)) ?? []
+    }
+    static func save(_ presets: [SavedCanvasPreset]) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(presets), forKey: key)
     }
 }
 

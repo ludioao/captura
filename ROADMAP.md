@@ -42,7 +42,7 @@ Outcome: a user records, edits and exports a polished MP4 without leaving Captur
 - [x] Export status, cancellation and actionable failures.
 - [x] Continuous export progress and disk-space preflight.
 - [x] Metal frame core, texture cache, shader pipeline and IOSurface output.
-- [ ] Route the live editor player through the shared Metal graph; export now uses it end-to-end.
+- [x] Route editor, floating preview and export through the shared Metal canvas/webcam/effect graph.
 - [x] Quick export using the last successful settings with collision-safe filenames.
 
 Acceptance:

@@ -339,6 +339,30 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertNotEqual(bytes[0], bytes[CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4])
     }
 
+    func testMetalPreviewUsesSharedVideoCompositor() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let media = directory.appending(path: "media", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await makeTestMovie(
+            at: media.appending(path: "screen.mov"),
+            size: CGSize(width: 160, height: 90),
+            frameCount: 15
+        )
+        var project = sampleProject(duration: 0.5)
+        project.settings.canvas = CanvasSize(width: 160, height: 90)
+
+        let item = try await MetalPreviewCompositionBuilder.makePlayerItem(
+            project: project,
+            packageURL: directory,
+            events: []
+        )
+
+        let compositorClass = try XCTUnwrap(item.videoComposition?.customVideoCompositorClass)
+        XCTAssertEqual(ObjectIdentifier(compositorClass), ObjectIdentifier(MetalProjectVideoCompositor.self))
+        XCTAssertTrue(item.videoComposition?.instructions.first is CapturaVideoInstruction)
+    }
+
     func testLegacyTimelineClipDefaultsToNormalSpeed() throws {
         let id = UUID()
         let mediaID = UUID()
@@ -435,6 +459,37 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(project.duration, 0.5, accuracy: 0.08)
         XCTAssertTrue(events.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: packageURL.appending(path: project.media.screen).path))
+    }
+
+    func testProjectStoreRecoversInterruptedRecordingManifest() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectStore()
+        let package = try await store.createPackage(in: directory)
+        try await makeTestMovie(at: package.screenMediaURL, size: CGSize(width: 320, height: 180), frameCount: 15)
+        try await store.writeRecoveryManifest(
+            RecordingRecoveryManifest(
+                createdAt: Date(),
+                canvas: CanvasSize(width: 320, height: 180),
+                sourceDisplay: CanvasSize(width: 320, height: 180),
+                frameRate: 30,
+                codec: .h264,
+                hasWebcam: false
+            ),
+            to: package
+        )
+
+        let recovered = await store.recoverInterruptedRecordings(in: directory)
+        let (project, events) = try await store.load(from: package.rootURL)
+
+        XCTAssertEqual(
+            recovered.map { $0.resolvingSymlinksInPath() },
+            [package.rootURL.resolvingSymlinksInPath()]
+        )
+        XCTAssertEqual(project.settings.canvas, CanvasSize(width: 320, height: 180))
+        XCTAssertEqual(project.duration, 0.5, accuracy: 0.08)
+        XCTAssertTrue(events.isEmpty)
     }
 
     func testOverlayRegionsPersistWithoutBreakingProject() throws {

@@ -14,6 +14,7 @@ private final class FloatingPreviewModel: ObservableObject {
     let cameraPlayer: AVPlayer?
     @Published var isPlaying = false
     @Published var currentTime = 0.0
+    @Published var usesMetalPreview = false
     private var timeObserver: FloatingTimeObserver?
 
     init(openProject: OpenProject) {
@@ -33,6 +34,23 @@ private final class FloatingPreviewModel: ObservableObject {
     func play() {
         SynchronizedPlayback.play(screenPlayer, cameraPlayer)
         isPlaying = true
+    }
+
+    func prepare(openProject: OpenProject) async {
+        do {
+            let item = try await MetalPreviewCompositionBuilder.makePlayerItem(
+                project: openProject.project,
+                packageURL: openProject.packageURL,
+                events: openProject.events
+            )
+            screenPlayer.replaceCurrentItem(with: item)
+            usesMetalPreview = true
+            play()
+        } catch {
+            usesMetalPreview = false
+            Log.render.error("Floating Metal preview failed: \(error.localizedDescription, privacy: .public)")
+            play()
+        }
     }
 
     func toggle() {
@@ -72,7 +90,8 @@ struct FloatingProjectPreview: View {
                 caption: activeCaption,
                 cameraFrame: currentCameraFrame,
                 overlays: openProject.project.overlays ?? [],
-                timelineTime: playback.currentTime
+                timelineTime: playback.currentTime,
+                isMetalComposed: playback.usesMetalPreview
             )
             .frame(width: 520, height: 292)
             HStack {
@@ -92,7 +111,7 @@ struct FloatingProjectPreview: View {
             .background(.regularMaterial)
         }
         .clipShape(RoundedRectangle(cornerRadius: 14))
-        .onAppear { playback.play() }
+        .task { await playback.prepare(openProject: openProject) }
         .onDisappear { playback.stop() }
     }
 

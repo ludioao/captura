@@ -14,13 +14,35 @@ struct CanvasMockupPreview: View {
     var cameraFrame: CameraKeyframe? = nil
     var overlays: [OverlayRegion] = []
     var timelineTime = 0.0
+    var isMetalComposed = false
     @State private var cameraDragOrigin: CGPoint?
     @State private var cameraResizeOrigin: CGSize?
 
     private let macTitlebarRatio = 0.032
 
     var body: some View {
-        GeometryReader { proxy in
+        Group {
+            if isMetalComposed {
+                GeometryReader { proxy in
+                    ZStack {
+                        NativePlayerView(player: player)
+                            .background(.black)
+                        if allowsCameraDragging, cameraPlayer != nil {
+                            cameraInteractionOverlay(in: proxy.size)
+                        }
+                        if let caption, !caption.isEmpty {
+                            Text(caption)
+                                .font(.system(size: max(14, proxy.size.width * 0.026), weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 9)
+                                .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
+                                .position(x: proxy.size.width / 2, y: proxy.size.height * 0.88)
+                        }
+                    }
+                }
+            } else {
+                GeometryReader { proxy in
             let shortestSide = min(proxy.size.width, proxy.size.height)
             let previewPadding = min(shortestSide * 0.22, max(14, shortestSide * appearance.padding / 720))
             ZStack {
@@ -92,9 +114,47 @@ struct CanvasMockupPreview: View {
                 )
                 .padding(previewPadding)
             }
+                }
+            }
         }
         .background(.black)
         .accessibilityLabel("Styled video preview")
+    }
+
+    private func cameraInteractionOverlay(in size: CGSize) -> some View {
+        let geometry = ExportGeometry(outputSize: size, sourceSize: sourceSize, appearance: appearance)
+        let width = geometry.cameraRect.width
+        let height = geometry.cameraRect.height
+        let halfWidth = appearance.cameraWidth / 2
+        let halfHeight = appearance.cameraHeight / 2
+        return Rectangle()
+            .fill(.clear)
+            .contentShape(Rectangle())
+            .frame(width: width, height: height)
+            .overlay(alignment: .bottomTrailing) {
+                CameraResizeHandle()
+                    .offset(x: 6, y: 6)
+                    .highPriorityGesture(cameraResizeGesture(in: geometry.screenRect.size))
+            }
+            .position(x: geometry.cameraRect.midX, y: geometry.cameraRect.midY)
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if cameraDragOrigin == nil {
+                        cameraDragOrigin = CGPoint(x: appearance.cameraPositionX, y: appearance.cameraPositionY)
+                    }
+                    guard let origin = cameraDragOrigin else { return }
+                    appearance.cameraPositionX = min(
+                        1 - halfWidth,
+                        max(halfWidth, origin.x + value.translation.width / max(geometry.screenRect.width, 1))
+                    )
+                    appearance.cameraPositionY = min(
+                        1 - halfHeight,
+                        max(halfHeight, origin.y + value.translation.height / max(geometry.screenRect.height, 1))
+                    )
+                }
+                .onEnded { _ in cameraDragOrigin = nil }
+            )
+            .help("Drag to reposition the camera")
     }
 
     private var activeOverlays: [OverlayRegion] {

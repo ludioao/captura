@@ -20,6 +20,7 @@ private final class PlaybackModel: ObservableObject {
     let player: AVPlayer
     let cameraPlayer: AVPlayer?
     @Published var currentTime = 0.0
+    @Published var usesMetalPreview = false
     private var observation: PlayerTimeObserver?
 
     init(url: URL, cameraURL: URL?) {
@@ -64,6 +65,30 @@ private final class PlaybackModel: ObservableObject {
             let mix = AVMutableAudioMix()
             mix.inputParameters = parameters
             item.audioMix = mix
+        }
+    }
+
+    func updateMetalPreview(project: ScreenProject, packageURL: URL, events: [InteractionEvent]) async {
+        let time = currentTime
+        let wasPlaying = player.timeControlStatus == .playing
+        do {
+            let item = try await MetalPreviewCompositionBuilder.makePlayerItem(
+                project: project,
+                packageURL: packageURL,
+                events: events
+            )
+            player.replaceCurrentItem(with: item)
+            usesMetalPreview = true
+            await player.seek(
+                to: CMTime(seconds: min(time, project.duration), preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+            updateAudio(project.settings.audio ?? .default)
+            if wasPlaying { player.play() }
+        } catch {
+            usesMetalPreview = false
+            Log.render.error("Metal preview rebuild failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
@@ -164,7 +189,8 @@ struct EditorView: View {
                     caption: activeCaption,
                     cameraFrame: currentCameraFrame,
                     overlays: project.overlays ?? [],
-                    timelineTime: playback.currentTime
+                    timelineTime: playback.currentTime,
+                    isMetalComposed: playback.usesMetalPreview
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 24)
@@ -230,6 +256,11 @@ struct EditorView: View {
         .task(id: openProject.project.id) {
             let url = openProject.packageURL.appending(path: openProject.project.media.screen)
             waveform = await AudioWaveform.load(from: url)
+            await playback.updateMetalPreview(
+                project: project,
+                packageURL: openProject.packageURL,
+                events: openProject.events
+            )
         }
         .onChange(of: project.settings.audio, initial: true) { _, value in
             playback.updateAudio(value ?? .default)
@@ -238,8 +269,13 @@ struct EditorView: View {
             autosaveTask?.cancel()
             hasUnsavedChanges = true
             autosaveTask = Task {
-                try? await Task.sleep(for: .milliseconds(900))
+                try? await Task.sleep(for: .milliseconds(650))
                 guard !Task.isCancelled else { return }
+                await playback.updateMetalPreview(
+                    project: value,
+                    packageURL: openProject.packageURL,
+                    events: openProject.events
+                )
                 if await save(value) { hasUnsavedChanges = false }
             }
         }

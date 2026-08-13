@@ -1,5 +1,4 @@
 import AVFoundation
-import AVKit
 import SwiftUI
 
 private final class PlayerTimeObserver: @unchecked Sendable {
@@ -17,11 +16,13 @@ private final class PlayerTimeObserver: @unchecked Sendable {
 @MainActor
 private final class PlaybackModel: ObservableObject {
     let player: AVPlayer
+    let cameraPlayer: AVPlayer?
     @Published var currentTime = 0.0
     private var observation: PlayerTimeObserver?
 
-    init(url: URL) {
+    init(url: URL, cameraURL: URL?) {
         player = AVPlayer(url: url)
+        cameraPlayer = cameraURL.map(AVPlayer.init(url:))
         let token = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] time in
             Task { @MainActor in self?.currentTime = max(0, time.seconds) }
         }
@@ -30,37 +31,74 @@ private final class PlaybackModel: ObservableObject {
 
     func seek(to seconds: Double) {
         player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        cameraPlayer?.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         currentTime = seconds
+    }
+
+    func togglePlayback() {
+        if player.timeControlStatus == .playing {
+            player.pause()
+            cameraPlayer?.pause()
+        } else {
+            player.play()
+            cameraPlayer?.play()
+        }
     }
 }
 
 struct EditorView: View {
+    @Environment(\.openWindow) private var openWindow
     let openProject: OpenProject
     let close: () -> Void
+    let save: (ScreenProject) async -> Bool
     @StateObject private var playback: PlaybackModel
-    @State private var timeline: Timeline
+    @State private var project: ScreenProject
     @State private var selectedClipID: UUID?
+    @State private var hasUnsavedChanges = false
+    @State private var showsEvents = false
+    @State private var showsCanvasInspector = true
 
-    init(openProject: OpenProject, close: @escaping () -> Void) {
+    init(openProject: OpenProject, close: @escaping () -> Void, save: @escaping (ScreenProject) async -> Bool) {
         self.openProject = openProject
         self.close = close
+        self.save = save
         let mediaURL = openProject.packageURL.appending(path: openProject.project.media.screen)
-        _playback = StateObject(wrappedValue: PlaybackModel(url: mediaURL))
-        _timeline = State(initialValue: openProject.project.timeline)
+        let cameraURL = openProject.project.media.camera.map { openProject.packageURL.appending(path: $0) }
+        _playback = StateObject(wrappedValue: PlaybackModel(url: mediaURL, cameraURL: cameraURL))
+        var project = openProject.project
+        if project.settings.appearance == nil { project.settings.appearance = .default }
+        _project = State(initialValue: project)
     }
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            Divider()
-            VideoPlayer(player: playback.player)
-                .background(.black)
+            HStack(spacing: 0) {
+                CanvasMockupPreview(
+                    player: playback.player,
+                    cameraPlayer: playback.cameraPlayer,
+                    sourceSize: project.settings.canvas,
+                    appearance: appearanceBinding
+                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(20)
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
+
+                if showsCanvasInspector {
+                    Divider()
+                    CanvasAppearanceInspector(
+                        appearance: appearanceBinding,
+                        hasCamera: playback.cameraPlayer != nil
+                    )
+                        .frame(width: 250)
+                }
+            }
             Divider()
+            transport
             TimelineCanvas(
-                timeline: timeline,
-                cameraKeyframes: openProject.project.cameraKeyframes,
+                timeline: project.timeline,
+                cameraKeyframes: project.cameraKeyframes,
                 events: openProject.events,
                 playhead: playback.currentTime,
                 selectedClipID: selectedClipID,
@@ -68,8 +106,10 @@ struct EditorView: View {
                 select: { selectedClipID = $0 }
             )
             .frame(height: 190)
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 8)
             eventSummary
+            if showsEvents { eventInspector }
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -77,28 +117,81 @@ struct EditorView: View {
     private var toolbar: some View {
         HStack(spacing: 12) {
             Button(action: close) { Image(systemName: "chevron.left") }
-            Text(openProject.packageURL.deletingPathExtension().lastPathComponent)
-                .font(.headline)
+                .buttonStyle(.borderless)
+                .help("Back to projects")
+            VStack(alignment: .leading, spacing: 1) {
+                Text(openProject.packageURL.deletingPathExtension().lastPathComponent)
+                    .font(.headline)
+                Text("HEVC · \(openProject.project.settings.frameRate) FPS · \(format(project.duration))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             Button {
-                playback.player.timeControlStatus == .playing ? playback.player.pause() : playback.player.play()
+                withAnimation(.easeOut(duration: 0.18)) { showsCanvasInspector.toggle() }
             } label: {
-                Label("Play/Pause", systemImage: playback.player.timeControlStatus == .playing ? "pause.fill" : "play.fill")
+                Label("Canvas", systemImage: "paintpalette")
+            }
+            .buttonStyle(.bordered)
+            .tint(showsCanvasInspector ? .accentColor : .secondary)
+            Button {
+                openWindow(id: "project-preview")
+            } label: {
+                Label("Floating Preview", systemImage: "pip")
             }
             Button("Split") { splitSelectedClip() }
                 .disabled(selectedClipID == nil)
             Button("Trim Start") { trimStart() }
                 .disabled(selectedClipID == nil)
-            Text("HEVC source · \(openProject.project.settings.frameRate) FPS")
-                .foregroundStyle(.secondary)
-                .font(.caption)
+            Button("Save") {
+                Task {
+                    if await save(project) { hasUnsavedChanges = false }
+                }
+            }
+            .keyboardShortcut("s")
+            .disabled(!hasUnsavedChanges)
         }
-        .padding(14)
+        .padding(.horizontal, 18)
+        .frame(height: 58)
+        .background(.bar)
+    }
+
+    private var transport: some View {
+        HStack(spacing: 14) {
+            Button {
+                playback.togglePlayback()
+            } label: {
+                Image(systemName: playback.player.timeControlStatus == .playing ? "pause.fill" : "play.fill")
+                    .frame(width: 18)
+            }
+            .buttonStyle(.borderedProminent)
+            .clipShape(Circle())
+            Text(format(playback.currentTime))
+                .monospacedDigit()
+                .font(.callout.weight(.medium))
+            Text("/")
+                .foregroundStyle(.tertiary)
+            Text(format(project.duration))
+                .monospacedDigit()
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Label("Timeline", systemImage: "timeline.selection")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 22)
+        .frame(height: 48)
     }
 
     private var eventSummary: some View {
         HStack {
-            Label("\(openProject.events.count) interaction events", systemImage: "cursorarrow.motionlines")
+            Button {
+                withAnimation { showsEvents.toggle() }
+            } label: {
+                Label("\(openProject.events.count) interaction events", systemImage: "cursorarrow.motionlines")
+            }
+            .buttonStyle(.link)
             Text("·")
             Text("\(openProject.events.filter { $0.type == .click }.count) clicks")
             Text("·")
@@ -114,18 +207,66 @@ struct EditorView: View {
         .padding(.bottom, 12)
     }
 
+    private func format(_ seconds: Double) -> String {
+        String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
+    }
+
+    private var appearanceBinding: Binding<CanvasAppearance> {
+        Binding(
+            get: { project.settings.appearance ?? .default },
+            set: {
+                project.settings.appearance = $0
+                hasUnsavedChanges = true
+            }
+        )
+    }
+
+    private var eventInspector: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 5) {
+                ForEach(openProject.events) { event in
+                    HStack(spacing: 10) {
+                        Text(String(format: "%8.3f", event.timestamp))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Text(event.type.rawValue)
+                            .frame(width: 90, alignment: .leading)
+                        if let x = event.normalizedX, let y = event.normalizedY {
+                            Text(String(format: "x %.3f  y %.3f", x, y))
+                                .monospacedDigit()
+                        }
+                        if let title = event.accessibility?.title ?? event.windowTitle {
+                            Text(title).lineLimit(1)
+                        }
+                        Spacer()
+                        if let application = event.accessibility?.applicationName ?? event.applicationName {
+                            Text(application).foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption)
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+        .frame(height: 120)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+    }
+
     private func splitSelectedClip() {
         guard let selectedClipID else { return }
-        timeline.split(clipID: selectedClipID, at: playback.currentTime)
+        project.timeline.split(clipID: selectedClipID, at: playback.currentTime)
+        hasUnsavedChanges = true
     }
 
     private func trimStart() {
         guard let selectedClipID,
-              let index = timeline.clips.firstIndex(where: { $0.id == selectedClipID }) else { return }
-        let clip = timeline.clips[index]
+              let index = project.timeline.clips.firstIndex(where: { $0.id == selectedClipID }) else { return }
+        let clip = project.timeline.clips[index]
         let sourceTime = clip.sourceStart + max(0, playback.currentTime - clip.timelineStart)
-        timeline.clips[index].trimStart(to: sourceTime)
-        timeline.rippleLayout()
+        project.timeline.clips[index].trimStart(to: sourceTime)
+        project.timeline.rippleLayout()
+        project.duration = project.timeline.duration
+        hasUnsavedChanges = true
     }
 }
 
@@ -154,7 +295,7 @@ private struct TimelineCanvas: View {
                 }
             })
         }
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .accessibilityLabel("Project timeline")
     }
 

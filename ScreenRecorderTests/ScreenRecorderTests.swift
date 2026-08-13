@@ -20,6 +20,94 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(decoded, project)
         XCTAssertEqual(decoded.formatVersion, 1)
         XCTAssertEqual(decoded.media.screen, "media/screen.mov")
+        XCTAssertNil(decoded.settings.appearance)
+    }
+
+    func testCanvasAppearancePersistsWithProject() throws {
+        var project = sampleProject(duration: 8)
+        project.settings.appearance = CanvasAppearance(
+            backgroundPreset: .ocean,
+            customColorHex: "#123456",
+            padding: 96,
+            cornerRadius: 24,
+            shadowStrength: 20,
+            showsWindowFrame: false,
+            cameraPositionX: 0.25,
+            cameraPositionY: 0.35,
+            cameraWidth: 0.31,
+            cameraHeight: 0.42
+        )
+
+        let data = try JSONEncoder().encode(project)
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: data)
+
+        XCTAssertEqual(decoded.settings.appearance, project.settings.appearance)
+    }
+
+    func testLegacyCanvasAppearanceGetsCameraPlacementDefaults() throws {
+        let legacyJSON = Data(#"""
+        {
+            "backgroundPreset": "midnight",
+            "customColorHex": "#123456",
+            "padding": 64,
+            "cornerRadius": 16,
+            "shadowStrength": 12,
+            "showsWindowFrame": true
+        }
+        """#.utf8)
+
+        let appearance = try JSONDecoder().decode(CanvasAppearance.self, from: legacyJSON)
+
+        XCTAssertEqual(appearance.cameraPositionX, 0.82)
+        XCTAssertEqual(appearance.cameraPositionY, 0.78)
+        XCTAssertEqual(appearance.cameraWidth, 0.24)
+        XCTAssertEqual(appearance.cameraHeight, 0.24)
+    }
+
+    func testLegacyCameraSizeMigratesToIndependentDimensions() throws {
+        let legacyJSON = Data(#"""
+        {
+            "cameraPositionX": 0.4,
+            "cameraPositionY": 0.6,
+            "cameraSize": 0.33
+        }
+        """#.utf8)
+
+        let appearance = try JSONDecoder().decode(CanvasAppearance.self, from: legacyJSON)
+
+        XCTAssertEqual(appearance.cameraWidth, 0.33)
+        XCTAssertEqual(appearance.cameraHeight, 0.33)
+    }
+
+    func testProjectStoreUpdatePersistsTimelineWithoutTouchingMedia() async throws {
+        let testDirectory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let root = testDirectory.appending(path: "Recent.screenproject", directoryHint: .isDirectory)
+        let media = root.appending(path: "media", directoryHint: .isDirectory)
+        let metadata = root.appending(path: "metadata", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: true)
+        let movie = media.appending(path: "screen.mov")
+        let sentinel = Data("source-media-remains-untouched".utf8)
+        try sentinel.write(to: movie)
+        defer { try? FileManager.default.removeItem(at: testDirectory) }
+
+        var project = sampleProject(duration: 12.5)
+        project.timeline.clips[0].trimEnd(to: 8)
+        project.duration = project.timeline.duration
+        let event = InteractionEvent(type: .click, timestamp: 1, normalizedX: 0.5, normalizedY: 0.5)
+        let store = ProjectStore()
+        try await store.update(project: project, events: [event], at: root)
+        let (loaded, events) = try await store.load(from: root)
+
+        XCTAssertEqual(loaded.duration, 8)
+        XCTAssertEqual(events, [event])
+        XCTAssertEqual(try Data(contentsOf: movie), sentinel)
+        let listed = try await store.recentProjects(in: testDirectory)
+        XCTAssertTrue(
+            listed.contains { $0.projectID == project.id && $0.url.standardizedFileURL == root.standardizedFileURL },
+            "Expected \(project.id) at \(root.path); listed: \(listed.map { "\($0.projectID) @ \($0.url.path)" })"
+        )
     }
 
     func testRelativeTimestampAccountsForPause() {

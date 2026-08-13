@@ -32,12 +32,21 @@ enum RecordingResolution: String, Codable, CaseIterable, Sendable {
 
 struct RecordingConfiguration: Sendable {
     var displayID: CGDirectDisplayID
+    var windowID: CGWindowID? = nil
     var resolution: RecordingResolution = .native
     var frameRate: Int = 60
     var codec: VideoCodec = .hevc
     var captureSystemAudio = true
     var captureMicrophone = false
+    var microphoneDeviceID: String? = nil
+    var captureWebcam = false
+    var webcamDeviceID: String? = nil
     var captureCursorInVideo = false
+}
+
+enum CaptureSourceKind: String, CaseIterable, Sendable {
+    case display = "Display"
+    case window = "Window"
 }
 
 struct DisplayChoice: Identifiable, Hashable, Sendable {
@@ -45,4 +54,26 @@ struct DisplayChoice: Identifiable, Hashable, Sendable {
     let name: String
     let width: Int
     let height: Int
+}
+
+struct WindowChoice: Identifiable, Hashable, Sendable {
+    let id: CGWindowID
+    let title: String
+    let applicationName: String
+    let width: Int
+    let height: Int
+
+    var displayName: String {
+        title.isEmpty ? applicationName : "\(applicationName) — \(title)"
+    }
+}
+
+struct MicrophoneChoice: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+}
+
+struct CameraChoice: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
 }

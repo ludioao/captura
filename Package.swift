@@ -9,7 +9,8 @@ let package = Package(
         .executableTarget(
             name: "ScreenRecorder",
             path: "ScreenRecorder",
-            exclude: ["ScreenRecorder.entitlements"]
+            exclude: ["ScreenRecorder.entitlements"],
+            resources: [.process("Assets.xcassets")]
         ),
         .testTarget(
             name: "ScreenRecorderTests",

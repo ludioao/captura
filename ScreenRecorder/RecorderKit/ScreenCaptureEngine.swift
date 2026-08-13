@@ -25,18 +25,53 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         }
     }
 
+    static func availableWindows() async throws -> [WindowChoice] {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        return content.windows.compactMap { window in
+            guard let app = window.owningApplication,
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier,
+                  window.frame.width >= 160,
+                  window.frame.height >= 100 else { return nil }
+            return WindowChoice(
+                id: window.windowID,
+                title: window.title ?? "",
+                applicationName: app.applicationName,
+                width: Int(window.frame.width),
+                height: Int(window.frame.height)
+            )
+        }
+        .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
     func start(
         configuration: RecordingConfiguration,
         outputURL: URL,
         failureHandler: @escaping @Sendable (RecorderError) -> Void
     ) async throws -> CaptureDetails {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first(where: { $0.displayID == configuration.displayID }) else {
-            throw RecorderError.displayUnavailable
+        let filter: SCContentFilter
+        let displayFrame: CGRect
+        let sourceWidth: Int
+        let sourceHeight: Int
+        if let windowID = configuration.windowID {
+            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+                throw RecorderError.displayUnavailable
+            }
+            filter = SCContentFilter(desktopIndependentWindow: window)
+            displayFrame = window.frame
+            sourceWidth = max(2, Int(window.frame.width * 2))
+            sourceHeight = max(2, Int(window.frame.height * 2))
+        } else {
+            guard let display = content.displays.first(where: { $0.displayID == configuration.displayID }) else {
+                throw RecorderError.displayUnavailable
+            }
+            let excludedApplications = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
+            filter = SCContentFilter(display: display, excludingApplications: excludedApplications, exceptingWindows: [])
+            displayFrame = display.frame
+            sourceWidth = display.width
+            sourceHeight = display.height
         }
-        let output = configuration.resolution.dimensions(nativeWidth: display.width, nativeHeight: display.height)
-        let excludedApplications = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
-        let filter = SCContentFilter(display: display, excludingApplications: excludedApplications, exceptingWindows: [])
+        let output = configuration.resolution.dimensions(nativeWidth: sourceWidth, nativeHeight: sourceHeight)
         let streamConfiguration = SCStreamConfiguration()
         streamConfiguration.width = output.width
         streamConfiguration.height = output.height
@@ -48,6 +83,8 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         streamConfiguration.sampleRate = 48_000
         streamConfiguration.channelCount = 2
         streamConfiguration.excludesCurrentProcessAudio = true
+        streamConfiguration.captureMicrophone = configuration.captureMicrophone
+        streamConfiguration.microphoneCaptureDeviceID = configuration.microphoneDeviceID
 
         let writer = try MediaWriter(
             outputURL: outputURL,
@@ -55,13 +92,17 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             height: output.height,
             frameRate: configuration.frameRate,
             codec: configuration.codec,
-            includesSystemAudio: configuration.captureSystemAudio
+            includesSystemAudio: configuration.captureSystemAudio,
+            includesMicrophone: configuration.captureMicrophone
         )
         let stream = SCStream(filter: filter, configuration: streamConfiguration, delegate: self)
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
             if configuration.captureSystemAudio {
                 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
+            }
+            if configuration.captureMicrophone {
+                try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: captureQueue)
             }
             self.writer = writer
             self.stream = stream
@@ -74,9 +115,9 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         }
         Log.capture.info("Capture started at \(output.width)x\(output.height), \(configuration.frameRate) fps")
         return CaptureDetails(
-            displayFrame: display.frame,
-            sourceWidth: display.width,
-            sourceHeight: display.height,
+            displayFrame: displayFrame,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
             outputWidth: output.width,
             outputHeight: output.height
         )
@@ -108,8 +149,7 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         case .audio:
             writer?.appendAudio(sampleBuffer)
         case .microphone:
-            // Microphone is intentionally not added until its independent track is implemented.
-            break
+            writer?.appendMicrophone(sampleBuffer)
         @unknown default:
             break
         }

@@ -11,6 +11,7 @@ struct PermissionSnapshot: Sendable {
     var screenRecording: PermissionStatus
     var microphone: PermissionStatus
     var accessibility: PermissionStatus
+    var camera: PermissionStatus
 }
 
 enum PermissionCenter {
@@ -18,7 +19,8 @@ enum PermissionCenter {
         PermissionSnapshot(
             screenRecording: CGPreflightScreenCaptureAccess() ? .granted : .notDetermined,
             microphone: status(for: AVCaptureDevice.authorizationStatus(for: .audio)),
-            accessibility: AXIsProcessTrusted() ? .granted : .notDetermined
+            accessibility: AXIsProcessTrusted() ? .granted : .notDetermined,
+            camera: status(for: AVCaptureDevice.authorizationStatus(for: .video))
         )
     }
 
@@ -30,6 +32,10 @@ enum PermissionCenter {
 
     static func requestMicrophone() async -> Bool {
         await AVCaptureDevice.requestAccess(for: .audio)
+    }
+
+    static func requestCamera() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .video)
     }
 
     static func requestAccessibility(prompt: Bool) -> Bool {

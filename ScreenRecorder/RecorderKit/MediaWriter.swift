@@ -12,6 +12,7 @@ final class MediaWriter: @unchecked Sendable {
     private let writer: AVAssetWriter
     private let videoInput: AVAssetWriterInput
     private let audioInput: AVAssetWriterInput?
+    private let microphoneInput: AVAssetWriterInput?
     private var hasStarted = false
     private var isPaused = false
     private var pauseStartedAt: CMTime?
@@ -29,7 +30,8 @@ final class MediaWriter: @unchecked Sendable {
         height: Int,
         frameRate: Int,
         codec: VideoCodec,
-        includesSystemAudio: Bool
+        includesSystemAudio: Bool,
+        includesMicrophone: Bool
     ) throws {
         do {
             writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
@@ -77,6 +79,24 @@ final class MediaWriter: @unchecked Sendable {
         } else {
             audioInput = nil
         }
+
+        if includesMicrophone {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderBitRateKey: 128_000
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+            input.expectsMediaDataInRealTime = true
+            guard writer.canAdd(input) else {
+                throw RecorderError.encoderInitializationFailed("AVAssetWriter rejected microphone settings")
+            }
+            writer.add(input)
+            microphoneInput = input
+        } else {
+            microphoneInput = nil
+        }
     }
 
     func appendVideo(_ sampleBuffer: CMSampleBuffer, dropped: Bool) {
@@ -97,6 +117,15 @@ final class MediaWriter: @unchecked Sendable {
         queue.async { [self] in
             guard let audioInput else { return }
             append(sample.value, to: audioInput, countsAsVideo: false)
+        }
+    }
+
+    func appendMicrophone(_ sampleBuffer: CMSampleBuffer) {
+        guard microphoneInput != nil else { return }
+        let sample = SampleBufferBox(value: sampleBuffer)
+        queue.async { [self] in
+            guard let microphoneInput else { return }
+            append(sample.value, to: microphoneInput, countsAsVideo: false)
         }
     }
 
@@ -121,6 +150,7 @@ final class MediaWriter: @unchecked Sendable {
                 }
                 videoInput.markAsFinished()
                 audioInput?.markAsFinished()
+                microphoneInput?.markAsFinished()
                 writer.finishWriting { [self] in
                     if writer.status == .completed {
                         continuation.resume(returning: metricsSnapshot())

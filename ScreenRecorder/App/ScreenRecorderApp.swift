@@ -8,8 +8,8 @@ struct CapturaApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(model)
-                .frame(minWidth: 760, minHeight: 560)
-                .task { await model.refreshDisplays() }
+                .frame(minWidth: 920, minHeight: 620)
+                .task { await model.prepareForRecording() }
                 .onOpenURL { url in Task { await model.openProject(at: url) } }
         }
         .windowStyle(.hiddenTitleBar)
@@ -19,5 +19,27 @@ struct CapturaApp: App {
                     .keyboardShortcut("o")
             }
         }
+
+        Window("captura Recording", id: "recording-controller") {
+            RecordingController()
+                .environmentObject(model)
+                .background(FloatingWindowAccessor())
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultPosition(.topTrailing)
+
+        Window("Project Preview", id: "project-preview") {
+            if let project = model.openProject {
+                FloatingProjectPreview(openProject: project)
+                    .id(project.project.id)
+                    .background(FloatingWindowAccessor())
+            } else {
+                ContentUnavailableView("No Project Open", systemImage: "play.rectangle")
+            }
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultPosition(.topTrailing)
     }
 }

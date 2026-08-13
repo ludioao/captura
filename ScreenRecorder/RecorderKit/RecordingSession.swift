@@ -5,6 +5,7 @@ actor RecordingSession {
     private let projectStore: ProjectStore
     private let captureEngine: ScreenCaptureEngine
     private let interactionRecorder: InteractionRecorder
+    private let webcamCaptureEngine: WebcamCaptureEngine
     private var configuration: RecordingConfiguration?
     private var package: ProjectPackage?
     private var details: CaptureDetails?
@@ -14,11 +15,13 @@ actor RecordingSession {
     init(
         projectStore: ProjectStore = ProjectStore(),
         captureEngine: ScreenCaptureEngine = ScreenCaptureEngine(),
-        interactionRecorder: InteractionRecorder = InteractionRecorder()
+        interactionRecorder: InteractionRecorder = InteractionRecorder(),
+        webcamCaptureEngine: WebcamCaptureEngine = WebcamCaptureEngine()
     ) {
         self.projectStore = projectStore
         self.captureEngine = captureEngine
         self.interactionRecorder = interactionRecorder
+        self.webcamCaptureEngine = webcamCaptureEngine
     }
 
     func states() -> AsyncStream<RecordingState> {
@@ -34,17 +37,6 @@ actor RecordingSession {
 
     func start(configuration: RecordingConfiguration) async throws {
         guard state == .idle || isTerminal(state) else { throw RecorderError.invalidState }
-        guard CGPreflightScreenCaptureAccess() else {
-            let error = RecorderError.permissionDenied("Screen Recording")
-            transition(to: .failed(error))
-            throw error
-        }
-        guard !configuration.captureMicrophone else {
-            let error = RecorderError.captureFailed("Microphone capture is not enabled in this milestone")
-            transition(to: .failed(error))
-            throw error
-        }
-
         transition(to: .preparing)
         do {
             let package = try await projectStore.createPackage()
@@ -55,6 +47,22 @@ actor RecordingSession {
                     Task { await self?.captureDidFail(error) }
                 }
             )
+            if configuration.captureWebcam {
+                guard let webcamDeviceID = configuration.webcamDeviceID else {
+                    _ = try? await captureEngine.stop()
+                    throw RecorderError.captureFailed("Choose a webcam before recording")
+                }
+                do {
+                    try await webcamCaptureEngine.start(
+                        deviceID: webcamDeviceID,
+                        outputURL: package.cameraMediaURL,
+                        frameRate: min(configuration.frameRate, 30)
+                    )
+                } catch {
+                    _ = try? await captureEngine.stop()
+                    throw error
+                }
+            }
             interactionRecorder.start(displayFrame: details.displayFrame)
             self.package = package
             self.configuration = configuration
@@ -73,6 +81,7 @@ actor RecordingSession {
     func pause() throws {
         guard state == .recording else { throw RecorderError.invalidState }
         captureEngine.pause()
+        if configuration?.captureWebcam == true { webcamCaptureEngine.pause() }
         interactionRecorder.pause()
         transition(to: .paused)
     }
@@ -80,6 +89,7 @@ actor RecordingSession {
     func resume() throws {
         guard state == .paused else { throw RecorderError.invalidState }
         captureEngine.resume()
+        if configuration?.captureWebcam == true { webcamCaptureEngine.resume() }
         interactionRecorder.resume()
         transition(to: .recording)
     }
@@ -91,11 +101,22 @@ actor RecordingSession {
               let details else { throw RecorderError.invalidState }
         if state == .paused {
             captureEngine.resume()
+            if configuration.captureWebcam { webcamCaptureEngine.resume() }
             interactionRecorder.resume()
         }
         transition(to: .stopping)
         do {
             let events = interactionRecorder.stop()
+            var webcamWasSaved = false
+            if configuration.captureWebcam {
+                do {
+                    try await webcamCaptureEngine.stop()
+                    let values = try package.cameraMediaURL.resourceValues(forKeys: [.fileSizeKey])
+                    webcamWasSaved = (values.fileSize ?? 0) > 0
+                } catch {
+                    Log.capture.error("Webcam finalization failed; preserving screen project: \(error.localizedDescription, privacy: .public)")
+                }
+            }
             var metrics = try await captureEngine.stop()
             metrics.eventCount = events.count
             let duration = metrics.elapsedSeconds
@@ -114,7 +135,12 @@ actor RecordingSession {
                 id: UUID(),
                 createdAt: Date(),
                 duration: duration,
-                media: ProjectMedia(screen: "media/screen.mov", microphone: nil, systemAudio: nil),
+                media: ProjectMedia(
+                    screen: "media/screen.mov",
+                    microphone: nil,
+                    systemAudio: nil,
+                    camera: webcamWasSaved ? "media/camera.mov" : nil
+                ),
                 settings: ProjectSettings(
                     canvas: CanvasSize(width: details.outputWidth, height: details.outputHeight),
                     sourceDisplay: CanvasSize(width: details.sourceWidth, height: details.sourceHeight),
@@ -157,8 +183,9 @@ actor RecordingSession {
         observers.removeValue(forKey: id)
     }
 
-    private func captureDidFail(_ error: RecorderError) {
+    private func captureDidFail(_ error: RecorderError) async {
         _ = interactionRecorder.stop()
+        if configuration?.captureWebcam == true { try? await webcamCaptureEngine.stop() }
         transition(to: .failed(error))
     }
 

@@ -29,6 +29,7 @@ Reference reviewed: <https://screen.studio/> and its public changelog on 2026-08
 - Display, window and interactive area capture plus MOV/MP4 import into editable projects.
 - Timed privacy masks/highlights and explicit on-device transcript generation.
 - Metal zero-copy render core for IOSurface-backed frames with GPU zoom/pan and cursor composition.
+- External muxed-device source for iPhone/iPad feeds and HDMI/USB capture hardware exposed by AVFoundation.
 
 ## M1 — Complete the shippable editor
 
@@ -104,7 +105,8 @@ Outcome: users can create branded, reusable templates and more complex demos.
 
 Outcome: Captura covers device demos and fast sharing workflows.
 
-- Connected iPhone/iPad capture with device model and orientation metadata.
+- [x] Connected-device discovery, selection, video/audio capture and editable project creation.
+- [ ] Device model/color/orientation metadata and hardware validation across iPhone/iPad generations.
 - iPhone/iPad frames and colors.
 - [x] Area capture with interactive preview guides.
 - [ ] Optional aspect locking while selecting the area.

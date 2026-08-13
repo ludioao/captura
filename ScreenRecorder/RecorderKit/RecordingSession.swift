@@ -6,6 +6,7 @@ actor RecordingSession {
     private let captureEngine: ScreenCaptureEngine
     private let interactionRecorder: InteractionRecorder
     private let webcamCaptureEngine: WebcamCaptureEngine
+    private let externalDeviceCaptureEngine: ExternalDeviceCaptureEngine
     private var configuration: RecordingConfiguration?
     private var package: ProjectPackage?
     private var details: CaptureDetails?
@@ -17,12 +18,14 @@ actor RecordingSession {
         projectStore: ProjectStore = ProjectStore(),
         captureEngine: ScreenCaptureEngine = ScreenCaptureEngine(),
         interactionRecorder: InteractionRecorder = InteractionRecorder(),
-        webcamCaptureEngine: WebcamCaptureEngine = WebcamCaptureEngine()
+        webcamCaptureEngine: WebcamCaptureEngine = WebcamCaptureEngine(),
+        externalDeviceCaptureEngine: ExternalDeviceCaptureEngine = ExternalDeviceCaptureEngine()
     ) {
         self.projectStore = projectStore
         self.captureEngine = captureEngine
         self.interactionRecorder = interactionRecorder
         self.webcamCaptureEngine = webcamCaptureEngine
+        self.externalDeviceCaptureEngine = externalDeviceCaptureEngine
     }
 
     func states() -> AsyncStream<RecordingState> {
@@ -60,19 +63,32 @@ actor RecordingSession {
             }
             let details: CaptureDetails
             do {
-                details = try await captureEngine.start(
-                    configuration: configuration,
-                    outputURL: package.screenMediaURL,
-                    timeline: timeline,
-                    failureHandler: { [weak self] error in
-                        Task { await self?.captureDidFail(error) }
-                    }
-                )
+                if let externalDeviceID = configuration.externalDeviceID {
+                    details = try await externalDeviceCaptureEngine.start(
+                        deviceID: externalDeviceID,
+                        outputURL: package.screenMediaURL,
+                        frameRate: min(configuration.frameRate, 60),
+                        codec: configuration.codec,
+                        captureAudio: configuration.captureSystemAudio,
+                        timeline: timeline
+                    )
+                } else {
+                    details = try await captureEngine.start(
+                        configuration: configuration,
+                        outputURL: package.screenMediaURL,
+                        timeline: timeline,
+                        failureHandler: { [weak self] error in
+                            Task { await self?.captureDidFail(error) }
+                        }
+                    )
+                }
             } catch {
                 if configuration.captureWebcam { try? await webcamCaptureEngine.stop() }
                 throw error
             }
-            interactionRecorder.start(displayFrame: details.displayFrame)
+            if configuration.externalDeviceID == nil {
+                interactionRecorder.start(displayFrame: details.displayFrame)
+            }
             self.package = package
             self.configuration = configuration
             self.details = details
@@ -113,7 +129,7 @@ actor RecordingSession {
         }
         transition(to: .stopping)
         do {
-            let events = interactionRecorder.stop()
+            let events = configuration.externalDeviceID == nil ? interactionRecorder.stop() : []
             var webcamWasSaved = false
             if configuration.captureWebcam {
                 do {
@@ -124,7 +140,9 @@ actor RecordingSession {
                     Log.capture.error("Webcam finalization failed; preserving screen project: \(error.localizedDescription, privacy: .public)")
                 }
             }
-            var metrics = try await captureEngine.stop()
+            var metrics = configuration.externalDeviceID == nil
+                ? try await captureEngine.stop()
+                : try await externalDeviceCaptureEngine.stop()
             metrics.eventCount = events.count
             let duration = metrics.elapsedSeconds
             let director = AutoDirector()
@@ -193,6 +211,7 @@ actor RecordingSession {
     private func captureDidFail(_ error: RecorderError) async {
         _ = interactionRecorder.stop()
         if configuration?.captureWebcam == true { try? await webcamCaptureEngine.stop() }
+        if configuration?.externalDeviceID != nil { _ = try? await externalDeviceCaptureEngine.stop() }
         transition(to: .failed(error))
     }
 

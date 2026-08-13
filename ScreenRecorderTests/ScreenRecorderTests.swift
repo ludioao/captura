@@ -209,6 +209,15 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(output.height, 1080)
     }
 
+    func testExternalDeviceDiscoveryHasStableUniqueIDs() {
+        let devices = ExternalDeviceCaptureEngine.availableDevices()
+        XCTAssertEqual(Set(devices.map(\.id)).count, devices.count)
+    }
+
+    func testDeviceIsASelectableCaptureSource() {
+        XCTAssertTrue(CaptureSourceKind.allCases.contains(.device))
+    }
+
     func testCameraKeyframesInterpolateSmoothly() throws {
         let frames = [
             CameraKeyframe(time: 0, centerX: 0.2, centerY: 0.3, scale: 1, easing: .linear),

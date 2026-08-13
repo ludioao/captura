@@ -78,6 +78,7 @@ private struct HomeView: View {
         .onChange(of: model.sourceKind) { _, _ in model.scheduleSourcePreviewRefresh() }
         .onChange(of: model.selectedDisplayID) { _, _ in model.scheduleSourcePreviewRefresh() }
         .onChange(of: model.selectedWindowID) { _, _ in model.scheduleSourcePreviewRefresh() }
+        .onChange(of: model.selectedExternalDeviceID) { _, _ in model.scheduleSourcePreviewRefresh() }
     }
 
     private var brandHeader: some View {
@@ -137,11 +138,23 @@ private struct HomeView: View {
                             Text("\(display.name) — \(display.width)×\(display.height)").tag(Optional(display.id))
                         }
                     }
-                } else {
+                } else if model.sourceKind == .window {
                     Picker("Window", selection: $model.selectedWindowID) {
                         ForEach(model.windows) { window in
                             Text("\(window.displayName) — \(window.width)×\(window.height)").tag(Optional(window.id))
                         }
+                    }
+                } else {
+                    HStack {
+                        Picker("Device", selection: $model.selectedExternalDeviceID) {
+                            ForEach(model.externalDevices) { device in
+                                Text(device.name).tag(Optional(device.id))
+                            }
+                        }
+                        Button {
+                            model.refreshExternalDevices()
+                        } label: { Image(systemName: "arrow.clockwise") }
+                            .help("Refresh connected devices")
                     }
                 }
             }
@@ -163,7 +176,10 @@ private struct HomeView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     sectionTitle("Inputs", icon: "waveform.and.mic")
                     Toggle(isOn: $model.captureSystemAudio) {
-                        Label("System audio", systemImage: "speaker.wave.2.fill")
+                        Label(
+                            model.sourceKind == .device ? "Device audio" : "System audio",
+                            systemImage: "speaker.wave.2.fill"
+                        )
                     }
                     Toggle(isOn: $model.captureMicrophone) {
                         Label("Microphone", systemImage: "mic.fill")
@@ -222,8 +238,10 @@ private struct HomeView: View {
                 .controlSize(.large)
                 .tint(.red)
                 .disabled(
-                    model.sourceStatusMessage != nil ||
-                    (model.sourceKind == .window ? model.selectedWindowID == nil : model.selectedDisplayID == nil) ||
+                    (model.sourceKind != .device && model.sourceStatusMessage != nil) ||
+                    (model.sourceKind == .device
+                        ? model.selectedExternalDeviceID == nil
+                        : (model.sourceKind == .window ? model.selectedWindowID == nil : model.selectedDisplayID == nil)) ||
                     model.recordingState == .preparing
                 )
             }
@@ -297,7 +315,7 @@ private struct HomeView: View {
     }
 
     private var previewSelectionKey: String {
-        "\(model.sourceKind.rawValue)-\(model.selectedDisplayID ?? 0)-\(model.selectedWindowID ?? 0)"
+        "\(model.sourceKind.rawValue)-\(model.selectedDisplayID ?? 0)-\(model.selectedWindowID ?? 0)-\(model.selectedExternalDeviceID ?? "")"
     }
 
     private var selectedSourceName: String {
@@ -308,6 +326,9 @@ private struct HomeView: View {
             }
             return name
         }
+        if model.sourceKind == .device {
+            return model.externalDevices.first(where: { $0.id == model.selectedExternalDeviceID })?.name ?? "External device"
+        }
         return model.windows.first(where: { $0.id == model.selectedWindowID })?.displayName ?? "Window preview"
     }
 
@@ -316,6 +337,7 @@ private struct HomeView: View {
         case .display: "display"
         case .window: "macwindow"
         case .area: "viewfinder.rectangular"
+        case .device: "ipad.and.iphone"
         }
     }
 

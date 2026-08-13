@@ -17,12 +17,14 @@ final class AppModel: ObservableObject {
     @Published var windows: [WindowChoice] = []
     @Published var microphones: [MicrophoneChoice] = []
     @Published var cameras: [CameraChoice] = []
+    @Published var externalDevices: [ExternalDeviceChoice] = []
     @Published var sourceKind: CaptureSourceKind = .display
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
     @Published var captureRegionNormalized = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
     @Published var selectedMicrophoneID: String?
     @Published var selectedCameraID: String?
+    @Published var selectedExternalDeviceID: String?
     @Published var resolution: RecordingResolution = .native
     @Published var frameRate = 60
     @Published var captureSystemAudio = true
@@ -90,6 +92,7 @@ final class AppModel: ObservableObject {
     func prepareForRecording() async {
         refreshMicrophones()
         refreshCameras()
+        refreshExternalDevices()
         await refreshDisplays()
         await refreshRecentProjects()
         await refreshSourcePreview()
@@ -106,6 +109,13 @@ final class AppModel: ObservableObject {
 
     func refreshSourcePreview() async {
         guard recordingState == .idle || isTerminalRecordingState else { return }
+        if sourceKind == .device {
+            sourcePreview = nil
+            sourcePreviewMessage = selectedExternalDeviceID == nil
+                ? "Connect and choose an iPhone, iPad, or capture device."
+                : "External device selected. Its native video feed will be recorded."
+            return
+        }
         let displayID = sourceKind == .display || sourceKind == .area ? selectedDisplayID : nil
         let windowID = sourceKind == .window ? selectedWindowID : nil
         guard displayID != nil || windowID != nil else {
@@ -180,10 +190,28 @@ final class AppModel: ObservableObject {
         if selectedCameraID == nil { selectedCameraID = cameras.first?.id }
     }
 
+    func refreshExternalDevices() {
+        externalDevices = ExternalDeviceCaptureEngine.availableDevices()
+        if selectedExternalDeviceID == nil { selectedExternalDeviceID = externalDevices.first?.id }
+    }
+
     func startRecording() async {
         errorMessage = nil
-        if displays.isEmpty && windows.isEmpty {
+        if sourceKind != .device && displays.isEmpty && windows.isEmpty {
             await refreshDisplays()
+        }
+        if sourceKind == .device && AVCaptureDevice.authorizationStatus(for: .video) != .authorized {
+            guard await PermissionCenter.requestCamera() else {
+                errorMessage = "Device video access was denied. Enable captura in Privacy & Security → Camera."
+                return
+            }
+            refreshExternalDevices()
+        }
+        if sourceKind == .device && captureSystemAudio && AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+            guard await PermissionCenter.requestMicrophone() else {
+                errorMessage = "Device audio access was denied. Disable device audio or enable captura in Privacy & Security → Microphone."
+                return
+            }
         }
         if captureWebcam && AVCaptureDevice.authorizationStatus(for: .video) != .authorized {
             guard await PermissionCenter.requestCamera() else {
@@ -201,7 +229,9 @@ final class AppModel: ObservableObject {
         }
         let displayID = selectedDisplayID ?? CGMainDisplayID()
         let windowID = sourceKind == .window ? selectedWindowID : nil
-        guard sourceKind == .window ? windowID != nil : selectedDisplayID != nil else {
+        guard sourceKind == .device
+                ? selectedExternalDeviceID != nil
+                : (sourceKind == .window ? windowID != nil : selectedDisplayID != nil) else {
             errorMessage = "Choose a \(sourceKind.rawValue.lowercased()) before recording."
             return
         }
@@ -209,6 +239,7 @@ final class AppModel: ObservableObject {
             displayID: displayID,
             windowID: windowID,
             normalizedCropRect: sourceKind == .area ? captureRegionNormalized : nil,
+            externalDeviceID: sourceKind == .device ? selectedExternalDeviceID : nil,
             resolution: resolution,
             frameRate: frameRate,
             codec: .hevc,

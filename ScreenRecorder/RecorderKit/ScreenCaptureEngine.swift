@@ -54,6 +54,7 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         let displayFrame: CGRect
         let sourceWidth: Int
         let sourceHeight: Int
+        var sourceRect: CGRect?
         if let windowID = configuration.windowID {
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
                 throw RecorderError.displayUnavailable
@@ -68,14 +69,35 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             }
             let excludedApplications = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
             filter = SCContentFilter(display: display, excludingApplications: excludedApplications, exceptingWindows: [])
-            displayFrame = display.frame
-            sourceWidth = display.width
-            sourceHeight = display.height
+            if let normalized = configuration.normalizedCropRect {
+                let crop = CGRect(
+                    x: min(max(normalized.minX, 0), 0.98) * Double(display.width),
+                    y: min(max(normalized.minY, 0), 0.98) * Double(display.height),
+                    width: min(max(normalized.width, 0.02), 1) * Double(display.width),
+                    height: min(max(normalized.height, 0.02), 1) * Double(display.height)
+                ).integral
+                sourceRect = crop
+                sourceWidth = max(2, Int(crop.width))
+                sourceHeight = max(2, Int(crop.height))
+                let scaleX = Double(display.width) / max(display.frame.width, 1)
+                let scaleY = Double(display.height) / max(display.frame.height, 1)
+                displayFrame = CGRect(
+                    x: display.frame.minX + crop.minX / scaleX,
+                    y: display.frame.minY + crop.minY / scaleY,
+                    width: crop.width / scaleX,
+                    height: crop.height / scaleY
+                )
+            } else {
+                displayFrame = display.frame
+                sourceWidth = display.width
+                sourceHeight = display.height
+            }
         }
         let output = configuration.resolution.dimensions(nativeWidth: sourceWidth, nativeHeight: sourceHeight)
         let streamConfiguration = SCStreamConfiguration()
         streamConfiguration.width = output.width
         streamConfiguration.height = output.height
+        if let sourceRect { streamConfiguration.sourceRect = sourceRect }
         streamConfiguration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(configuration.frameRate))
         streamConfiguration.queueDepth = 6
         streamConfiguration.pixelFormat = kCVPixelFormatType_32BGRA

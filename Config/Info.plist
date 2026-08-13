@@ -47,6 +47,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>captura uses the microphone when microphone capture is enabled.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>captura transcribes recorded audio into editable captions only when you request it.</string>
     <key>NSCameraUsageDescription</key>
     <string>captura records the selected camera as a separate, editable webcam track.</string>
     <key>UTExportedTypeDeclarations</key>

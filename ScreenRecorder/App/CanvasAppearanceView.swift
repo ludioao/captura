@@ -12,6 +12,8 @@ struct CanvasMockupPreview: View {
     var cursorAppearance: CursorAppearance = .default
     var caption: String? = nil
     var cameraFrame: CameraKeyframe? = nil
+    var overlays: [OverlayRegion] = []
+    var timelineTime = 0.0
     @State private var cameraDragOrigin: CGPoint?
     @State private var cameraResizeOrigin: CGSize?
 
@@ -56,6 +58,10 @@ struct CanvasMockupPreview: View {
                                         )
                                 }
 
+                                ForEach(activeOverlays) { overlay in
+                                    overlayView(overlay, in: contentProxy.size)
+                                }
+
                                 if let caption, !caption.isEmpty {
                                     Text(caption)
                                         .font(.system(size: max(14, contentProxy.size.width * 0.026), weight: .semibold))
@@ -89,6 +95,36 @@ struct CanvasMockupPreview: View {
         }
         .background(.black)
         .accessibilityLabel("Styled video preview")
+    }
+
+    private var activeOverlays: [OverlayRegion] {
+        overlays.filter { timelineTime >= $0.startTime && timelineTime <= $0.endTime }
+    }
+
+    @ViewBuilder
+    private func overlayView(_ overlay: OverlayRegion, in size: CGSize) -> some View {
+        let rect = CGRect(
+            x: size.width * (overlay.normalizedX - overlay.normalizedWidth / 2),
+            y: size.height * (overlay.normalizedY - overlay.normalizedHeight / 2),
+            width: size.width * overlay.normalizedWidth,
+            height: size.height * overlay.normalizedHeight
+        )
+        switch overlay.kind {
+        case .privacy:
+            RoundedRectangle(cornerRadius: 7)
+                .fill(.ultraThickMaterial)
+                .overlay {
+                    Image(systemName: "eye.slash.fill").foregroundStyle(.secondary)
+                }
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        case .highlight:
+            RoundedRectangle(cornerRadius: 7)
+                .fill(.yellow.opacity(0.15))
+                .stroke(.yellow, lineWidth: 3)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        }
     }
 
     private var sourceAspectRatio: Double {

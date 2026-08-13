@@ -135,6 +135,8 @@ struct EditorView: View {
     @State private var showsCaptionEntry = false
     @State private var captionDraft = ""
     @State private var autosaveTask: Task<Void, Never>?
+    @State private var isTranscribing = false
+    @State private var transcriptionError: String?
 
     init(openProject: OpenProject, close: @escaping () -> Void, save: @escaping (ScreenProject) async -> Bool) {
         self.openProject = openProject
@@ -160,7 +162,9 @@ struct EditorView: View {
                     cursorSample: currentCursorSample,
                     cursorAppearance: project.settings.cursor ?? .default,
                     caption: activeCaption,
-                    cameraFrame: currentCameraFrame
+                    cameraFrame: currentCameraFrame,
+                    overlays: project.overlays ?? [],
+                    timelineTime: playback.currentTime
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 24)
@@ -213,6 +217,14 @@ struct EditorView: View {
             Button("Add") { addCaption() }.disabled(captionDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: {
             Text("The caption starts at the playhead and lasts three seconds.")
+        }
+        .alert("Transcription failed", isPresented: Binding(
+            get: { transcriptionError != nil },
+            set: { if !$0 { transcriptionError = nil } }
+        )) {
+            Button("OK", role: .cancel) { transcriptionError = nil }
+        } message: {
+            Text(transcriptionError ?? "Unknown error")
         }
         .task(id: openProject.project.id) {
             let url = openProject.packageURL.appending(path: openProject.project.media.screen)
@@ -378,6 +390,13 @@ struct EditorView: View {
         )
     }
 
+    private var overlaysBinding: Binding<[OverlayRegion]> {
+        Binding(
+            get: { project.overlays ?? [] },
+            set: { project.overlays = $0; hasUnsavedChanges = true }
+        )
+    }
+
     private var currentCursorSample: CursorSample? {
         let sourceTime = project.timeline.sourceTime(at: playback.currentTime) ?? playback.currentTime
         let samples = openProject.events.compactMap { event -> CursorSample? in
@@ -425,7 +444,14 @@ struct EditorView: View {
                 CaptionInspector(
                     captions: project.captions ?? [],
                     add: { showsCaptionEntry = true },
-                    delete: deleteCaption
+                    delete: deleteCaption,
+                    generate: generateTranscript,
+                    isGenerating: isTranscribing
+                )
+            case .overlays:
+                OverlayInspector(
+                    overlays: overlaysBinding,
+                    add: addOverlay
                 )
             }
         }
@@ -448,6 +474,44 @@ struct EditorView: View {
 
     private func deleteCaption(_ id: UUID) {
         project.captions?.removeAll { $0.id == id }
+        hasUnsavedChanges = true
+    }
+
+    private func generateTranscript() {
+        guard !isTranscribing else { return }
+        isTranscribing = true
+        let mediaURL = openProject.packageURL.appending(path: project.media.screen)
+        Task {
+            defer { isTranscribing = false }
+            do {
+                let sourceCues = try await LocalTranscriber().transcribe(url: mediaURL)
+                let timelineCues = sourceCues.compactMap { cue -> CaptionCue? in
+                    guard let start = project.timeline.firstTimelineTime(forSourceTime: cue.startTime),
+                          let end = project.timeline.firstTimelineTime(forSourceTime: cue.endTime) else { return nil }
+                    return CaptionCue(startTime: start, endTime: max(start + 0.2, end), text: cue.text)
+                }
+                project.captions = timelineCues
+                hasUnsavedChanges = true
+            } catch {
+                transcriptionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func addOverlay(_ kind: OverlayRegionKind) {
+        let point = currentCursorSample.map { CGPoint(x: $0.normalizedX, y: $0.normalizedY) }
+            ?? CGPoint(x: 0.5, y: 0.5)
+        var overlays = project.overlays ?? []
+        overlays.append(OverlayRegion(
+            startTime: playback.currentTime,
+            endTime: min(project.duration, playback.currentTime + 3),
+            normalizedX: point.x,
+            normalizedY: point.y,
+            normalizedWidth: 0.24,
+            normalizedHeight: 0.14,
+            kind: kind
+        ))
+        project.overlays = overlays
         hasUnsavedChanges = true
     }
 
@@ -674,7 +738,7 @@ private enum ExportPreset: String, CaseIterable, Identifiable {
 }
 
 private enum EditorInspectorSection: String, CaseIterable, Identifiable {
-    case canvas, audio, cursor, captions
+    case canvas, audio, cursor, captions, overlays
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -682,7 +746,55 @@ private enum EditorInspectorSection: String, CaseIterable, Identifiable {
         case .audio: "waveform"
         case .cursor: "cursorarrow.motionlines"
         case .captions: "captions.bubble"
+        case .overlays: "rectangle.dashed"
         }
+    }
+}
+
+private struct OverlayInspector: View {
+    @Binding var overlays: [OverlayRegion]
+    let add: (OverlayRegionKind) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Overlays").font(.headline)
+            HStack {
+                Button("Privacy") { add(.privacy) }
+                Button("Highlight") { add(.highlight) }
+            }
+            Text("New overlays start at the playhead, follow the cursor position and last three seconds.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if overlays.isEmpty {
+                ContentUnavailableView("No overlays", systemImage: "rectangle.dashed")
+            } else {
+                List {
+                    ForEach($overlays) { $overlay in
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack {
+                                Label(
+                                    overlay.kind == .privacy ? "Privacy mask" : "Highlight",
+                                    systemImage: overlay.kind == .privacy ? "eye.slash" : "highlighter"
+                                )
+                                Spacer()
+                                Button(role: .destructive) {
+                                    overlays.removeAll { $0.id == overlay.id }
+                                } label: { Image(systemName: "trash") }
+                                .buttonStyle(.borderless)
+                            }
+                            HStack {
+                                TextField("Start", value: $overlay.startTime, format: .number.precision(.fractionLength(1)))
+                                TextField("End", value: $overlay.endTime, format: .number.precision(.fractionLength(1)))
+                            }
+                            Slider(value: $overlay.normalizedWidth, in: 0.08...0.8) { Text("Width") }
+                            Slider(value: $overlay.normalizedHeight, in: 0.06...0.8) { Text("Height") }
+                        }
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .padding(16)
     }
 }
 
@@ -735,6 +847,8 @@ private struct CaptionInspector: View {
     let captions: [CaptionCue]
     let add: () -> Void
     let delete: (UUID) -> Void
+    let generate: () -> Void
+    let isGenerating: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -744,6 +858,15 @@ private struct CaptionInspector: View {
                 Button(action: add) { Image(systemName: "plus") }
                     .help("Add caption at playhead")
             }
+            Button(action: generate) {
+                if isGenerating {
+                    ProgressView().controlSize(.small)
+                    Text("Transcribing on device…")
+                } else {
+                    Label("Generate from audio", systemImage: "waveform.and.mic")
+                }
+            }
+            .disabled(isGenerating)
             if captions.isEmpty {
                 ContentUnavailableView(
                     "No captions",

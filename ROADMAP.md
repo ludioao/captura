@@ -26,6 +26,8 @@ Reference reviewed: <https://screen.studio/> and its public changelog on 2026-08
 - H.264/HEVC MP4 export with canvas, window chrome, camera, audio and common aspect-ratio presets.
 - Animated GIF export, real audio waveform, per-source mix controls, editable captions and rendered cursor/click effects.
 - Automatic/manual zoom playback and export, debounced autosave and export disk-space preflight.
+- Display, window and interactive area capture plus MOV/MP4 import into editable projects.
+- Timed privacy masks/highlights and explicit on-device transcript generation.
 
 ## M1 — Complete the shippable editor
 
@@ -73,7 +75,7 @@ Outcome: tutorials sound clean and remain understandable without audio.
 - Voice normalization and local noise reduction.
 - Stereo microphone support and channel routing.
 - [x] Manual editable subtitle track with preview/export rendering.
-- [ ] On-device transcript generation.
+- [x] On-device transcript generation requested explicitly from the captions inspector.
 - Keyboard shortcut overlays with per-range visibility.
 - Optional background music and ducking.
 
@@ -90,9 +92,10 @@ Outcome: users can create branded, reusable templates and more complex demos.
 - Presets for canvas, camera, cursor, zoom and export settings.
 - Import/export of shareable preset files.
 - Dynamic webcam layouts: hidden, picture-in-picture and fullscreen ranges.
-- Crop, blur masks and highlight masks for sensitive or important areas.
+- [x] Timed privacy and highlight masks for sensitive or important areas.
+- [ ] True Gaussian blur masks in the Metal compositor.
 - Custom cursor packs and additional macOS/device frames.
-- Import existing MOV/MP4 files into a project.
+- [x] Import existing MOV/MP4 files into a project.
 - [x] GIF export with scale, FPS, quality and infinite loop.
 
 ## M5 — Capture and distribution expansion
@@ -101,7 +104,8 @@ Outcome: Captura covers device demos and fast sharing workflows.
 
 - Connected iPhone/iPad capture with device model and orientation metadata.
 - iPhone/iPad frames and colors.
-- Area capture with guides and aspect locking.
+- [x] Area capture with interactive preview guides.
+- [ ] Optional aspect locking while selecting the area.
 - Batch export and copy exported media/current frame to clipboard.
 - Optional shareable links behind a separate, privacy-explicit service boundary.
 - Crash-safe recording recovery and autosave snapshots.

@@ -203,6 +203,12 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertNil(timeline.sourceTime(at: 1))
     }
 
+    func testRecordingResolutionPreservesNonWidescreenAspect() {
+        let output = RecordingResolution.fullHD.dimensions(nativeWidth: 1000, nativeHeight: 1000)
+        XCTAssertEqual(output.width, 1080)
+        XCTAssertEqual(output.height, 1080)
+    }
+
     func testCameraKeyframesInterpolateSmoothly() throws {
         let frames = [
             CameraKeyframe(time: 0, centerX: 0.2, centerY: 0.3, scale: 1, easing: .linear),
@@ -281,6 +287,38 @@ final class ScreenRecorderTests: XCTestCase {
 
         let imageSource = try XCTUnwrap(CGImageSourceCreateWithURL(destination as CFURL, nil))
         XCTAssertGreaterThanOrEqual(CGImageSourceGetCount(imageSource), 2)
+    }
+
+    func testProjectStoreImportsExistingMovie() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appending(path: "source.mov")
+        let projects = directory.appending(path: "projects", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        try await makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 15)
+
+        let store = ProjectStore()
+        let packageURL = try await store.importVideo(from: source, in: projects)
+        let (project, events) = try await store.load(from: packageURL)
+
+        XCTAssertEqual(project.settings.canvas, CanvasSize(width: 320, height: 180))
+        XCTAssertEqual(project.duration, 0.5, accuracy: 0.08)
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: packageURL.appending(path: project.media.screen).path))
+    }
+
+    func testOverlayRegionsPersistWithoutBreakingProject() throws {
+        var project = sampleProject(duration: 5)
+        project.overlays = [OverlayRegion(
+            startTime: 1, endTime: 4,
+            normalizedX: 0.5, normalizedY: 0.5,
+            normalizedWidth: 0.3, normalizedHeight: 0.2,
+            kind: .privacy
+        )]
+        let data = try JSONEncoder().encode(project)
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: data)
+        XCTAssertEqual(decoded.overlays, project.overlays)
     }
 
     func testNearbyClicksAreGroupedIntoOneIntent() {

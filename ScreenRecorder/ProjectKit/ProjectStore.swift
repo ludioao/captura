@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import Foundation
 
 struct ProjectPackage: Sendable {
@@ -37,6 +38,50 @@ actor ProjectStore {
             cameraMediaURL: media.appending(path: "camera.mov"),
             eventsURL: metadata.appending(path: "events.json")
         )
+    }
+
+    func importVideo(from sourceURL: URL, in parent: URL? = nil) async throws -> URL {
+        let package = try createPackage(in: parent)
+        do {
+            try fileManager.copyItem(at: sourceURL, to: package.screenMediaURL)
+            let asset = AVURLAsset(url: package.screenMediaURL)
+            guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let duration = max(0, try await asset.load(.duration).seconds)
+            let naturalSize = try await track.load(.naturalSize)
+            let transform = try await track.load(.preferredTransform)
+            let transformed = CGRect(origin: .zero, size: naturalSize).applying(transform)
+            let width = max(2, Int(abs(transformed.width)))
+            let height = max(2, Int(abs(transformed.height)))
+            let nominalFPS = try await track.load(.nominalFrameRate)
+            let fps = nominalFPS >= 50 ? 60 : 30
+            let mediaID = UUID()
+            let project = ScreenProject(
+                id: UUID(),
+                createdAt: Date(),
+                duration: duration,
+                media: ProjectMedia(screen: "media/screen.mov"),
+                settings: ProjectSettings(
+                    canvas: CanvasSize(width: width, height: height),
+                    sourceDisplay: CanvasSize(width: width, height: height),
+                    frameRate: fps,
+                    codec: .h264,
+                    appearance: .default
+                ),
+                recording: RecordingMetadata(eventsPath: "metadata/events.json", eventCount: 0, droppedVideoFrames: 0),
+                cameraKeyframes: [],
+                timeline: Timeline(clips: [TimelineClip(
+                    id: UUID(), sourceMediaID: mediaID,
+                    sourceStart: 0, sourceEnd: duration, timelineStart: 0
+                )])
+            )
+            try save(project: project, events: [], to: package)
+            return package.rootURL
+        } catch {
+            try? fileManager.removeItem(at: package.rootURL)
+            throw error
+        }
     }
 
     func save(project: ScreenProject, events: [InteractionEvent], to package: ProjectPackage) throws {

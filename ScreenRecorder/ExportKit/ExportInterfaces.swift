@@ -432,10 +432,51 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         outline.lineWidth = max(1, geometry.scale)
         root.addSublayer(outline)
 
+        addOverlays(to: root, geometry: geometry, regions: project.overlays ?? [], duration: duration)
         addCursor(to: root, geometry: geometry, project: project, events: events, duration: duration)
         addCaptions(to: root, geometry: geometry, cues: project.captions ?? [], duration: duration)
 
         return AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: root)
+    }
+
+    private func addOverlays(
+        to root: CALayer,
+        geometry: ExportGeometry,
+        regions: [OverlayRegion],
+        duration: Double
+    ) {
+        guard duration > 0 else { return }
+        for region in regions where region.endTime > region.startTime {
+            let layer = CALayer()
+            layer.frame = CGRect(
+                x: geometry.screenRect.minX + geometry.screenRect.width * (region.normalizedX - region.normalizedWidth / 2),
+                y: geometry.screenRect.minY + geometry.screenRect.height * (region.normalizedY - region.normalizedHeight / 2),
+                width: geometry.screenRect.width * region.normalizedWidth,
+                height: geometry.screenRect.height * region.normalizedHeight
+            )
+            layer.cornerRadius = 7 * geometry.scale
+            if region.kind == .privacy {
+                layer.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.96).cgColor
+                layer.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+                layer.borderWidth = max(1, geometry.scale)
+            } else {
+                layer.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.14).cgColor
+                layer.borderColor = NSColor.systemYellow.cgColor
+                layer.borderWidth = max(2, 3 * geometry.scale)
+            }
+            layer.opacity = 0
+            let visibility = CAKeyframeAnimation(keyPath: "opacity")
+            let start = min(max(region.startTime / duration, 0), 1)
+            let end = min(max(region.endTime / duration, start), 1)
+            visibility.values = [0, 0, 1, 1, 0, 0]
+            visibility.keyTimes = [0, NSNumber(value: start), NSNumber(value: start), NSNumber(value: end), NSNumber(value: end), 1]
+            visibility.duration = duration
+            visibility.beginTime = AVCoreAnimationBeginTimeAtZero
+            visibility.calculationMode = .discrete
+            visibility.isRemovedOnCompletion = false
+            layer.add(visibility, forKey: "captura.overlay.visibility")
+            root.addSublayer(layer)
+        }
     }
 
     private func addCursor(

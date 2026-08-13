@@ -132,6 +132,22 @@ struct CaptionCue: Codable, Identifiable, Hashable, Sendable {
     var text: String
 }
 
+enum OverlayRegionKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case privacy
+    case highlight
+}
+
+struct OverlayRegion: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var startTime: Double
+    var endTime: Double
+    var normalizedX: Double
+    var normalizedY: Double
+    var normalizedWidth: Double
+    var normalizedHeight: Double
+    var kind: OverlayRegionKind
+}
+
 struct RecordingMetadata: Codable, Hashable, Sendable {
     var eventsPath: String
     var eventCount: Int
@@ -151,6 +167,7 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var cameraKeyframes: [CameraKeyframe]
     var timeline: Timeline
     var captions: [CaptionCue]? = nil
+    var overlays: [OverlayRegion]? = nil
 }
 
 struct RecentProject: Identifiable, Hashable, Sendable {

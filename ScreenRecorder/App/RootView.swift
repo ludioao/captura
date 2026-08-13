@@ -110,7 +110,7 @@ private struct HomeView: View {
                 sectionTitle("Source", icon: "rectangle.dashed.badge.record")
                 Picker("Capture", selection: $model.sourceKind) {
                     ForEach(CaptureSourceKind.allCases, id: \.self) {
-                        Label($0.rawValue, systemImage: $0 == .display ? "display" : "macwindow").tag($0)
+                        Label($0.rawValue, systemImage: sourceIcon($0)).tag($0)
                     }
                 }
                 .labelsHidden()
@@ -131,7 +131,7 @@ private struct HomeView: View {
                         }
                         .buttonStyle(.link)
                     }
-                } else if model.sourceKind == .display {
+                } else if model.sourceKind == .display || model.sourceKind == .area {
                     Picker("Display", selection: $model.selectedDisplayID) {
                         ForEach(model.displays) { display in
                             Text("\(display.name) — \(display.width)×\(display.height)").tag(Optional(display.id))
@@ -223,7 +223,7 @@ private struct HomeView: View {
                 .tint(.red)
                 .disabled(
                     model.sourceStatusMessage != nil ||
-                    (model.sourceKind == .display ? model.selectedDisplayID == nil : model.selectedWindowID == nil) ||
+                    (model.sourceKind == .window ? model.selectedWindowID == nil : model.selectedDisplayID == nil) ||
                     model.recordingState == .preparing
                 )
             }
@@ -252,11 +252,14 @@ private struct HomeView: View {
                     }
                     .foregroundStyle(.white.opacity(0.7))
                 }
+                if model.sourceKind == .area, model.sourcePreview != nil {
+                    AreaSelectionOverlay(rect: $model.captureRegionNormalized)
+                }
             }
             .aspectRatio(16 / 9, contentMode: .fit)
 
             HStack(spacing: 8) {
-                Image(systemName: model.sourceKind == .display ? "display" : "macwindow")
+                Image(systemName: sourceIcon(model.sourceKind))
                 Text(selectedSourceName)
                     .lineLimit(1)
                 Spacer()
@@ -298,10 +301,22 @@ private struct HomeView: View {
     }
 
     private var selectedSourceName: String {
-        if model.sourceKind == .display {
-            return model.displays.first(where: { $0.id == model.selectedDisplayID })?.name ?? "Display preview"
+        if model.sourceKind == .display || model.sourceKind == .area {
+            let name = model.displays.first(where: { $0.id == model.selectedDisplayID })?.name ?? "Display preview"
+            if model.sourceKind == .area {
+                return "\(name) — \(Int(model.captureRegionNormalized.width * 100))% × \(Int(model.captureRegionNormalized.height * 100))%"
+            }
+            return name
         }
         return model.windows.first(where: { $0.id == model.selectedWindowID })?.displayName ?? "Window preview"
+    }
+
+    private func sourceIcon(_ kind: CaptureSourceKind) -> String {
+        switch kind {
+        case .display: "display"
+        case .window: "macwindow"
+        case .area: "viewfinder.rectangular"
+        }
     }
 
     private func sectionTitle(_ title: String, icon: String) -> some View {
@@ -312,6 +327,59 @@ private struct HomeView: View {
 
     private var permissionColor: Color {
         model.permissionSnapshot.screenRecording == .granted ? .green : .orange
+    }
+}
+
+private struct AreaSelectionOverlay: View {
+    @Binding var rect: CGRect
+    @State private var dragStart: CGPoint?
+
+    var body: some View {
+        GeometryReader { proxy in
+            let selection = CGRect(
+                x: rect.minX * proxy.size.width,
+                y: rect.minY * proxy.size.height,
+                width: rect.width * proxy.size.width,
+                height: rect.height * proxy.size.height
+            )
+            ZStack {
+                Path { path in
+                    path.addRect(CGRect(origin: .zero, size: proxy.size))
+                    path.addRect(selection)
+                }
+                .fill(.black.opacity(0.48), style: FillStyle(eoFill: true))
+                Rectangle()
+                    .stroke(.white, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                    .frame(width: selection.width, height: selection.height)
+                    .position(x: selection.midX, y: selection.midY)
+                Text("Drag to select recording area")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(.black.opacity(0.7), in: Capsule())
+                    .position(x: selection.midX, y: max(18, selection.minY - 18))
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 4)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = value.startLocation }
+                    guard let start = dragStart else { return }
+                    let minX = min(start.x, value.location.x) / max(proxy.size.width, 1)
+                    let minY = min(start.y, value.location.y) / max(proxy.size.height, 1)
+                    let width = abs(value.location.x - start.x) / max(proxy.size.width, 1)
+                    let height = abs(value.location.y - start.y) / max(proxy.size.height, 1)
+                    rect = CGRect(
+                        x: min(max(minX, 0), 0.98),
+                        y: min(max(minY, 0), 0.98),
+                        width: min(max(width, 0.02), 1 - minX),
+                        height: min(max(height, 0.02), 1 - minY)
+                    )
+                }
+                .onEnded { _ in dragStart = nil }
+            )
+        }
+        .accessibilityLabel("Recording area selection")
     }
 }
 
@@ -363,6 +431,15 @@ private struct RecentProjectsView: View {
                 Task { await model.chooseProject() }
             } label: {
                 Label("Open Project…", systemImage: "folder")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.recordingState == .preparing)
+
+            Button {
+                Task { await model.chooseMediaToImport() }
+            } label: {
+                Label("Import Video…", systemImage: "square.and.arrow.down")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)

@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 struct OpenProject: Sendable {
     var project: ScreenProject
@@ -19,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var sourceKind: CaptureSourceKind = .display
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
+    @Published var captureRegionNormalized = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
     @Published var selectedMicrophoneID: String?
     @Published var selectedCameraID: String?
     @Published var resolution: RecordingResolution = .native
@@ -104,7 +106,7 @@ final class AppModel: ObservableObject {
 
     func refreshSourcePreview() async {
         guard recordingState == .idle || isTerminalRecordingState else { return }
-        let displayID = sourceKind == .display ? selectedDisplayID : nil
+        let displayID = sourceKind == .display || sourceKind == .area ? selectedDisplayID : nil
         let windowID = sourceKind == .window ? selectedWindowID : nil
         guard displayID != nil || windowID != nil else {
             sourcePreview = nil
@@ -116,7 +118,7 @@ final class AppModel: ObservableObject {
         defer { isRefreshingSourcePreview = false }
         do {
             let image = try await SourcePreviewService.snapshot(displayID: displayID, windowID: windowID)
-            guard displayID == (sourceKind == .display ? selectedDisplayID : nil),
+            guard displayID == (sourceKind == .display || sourceKind == .area ? selectedDisplayID : nil),
                   windowID == (sourceKind == .window ? selectedWindowID : nil) else { return }
             sourcePreview = image
             sourcePreviewMessage = nil
@@ -199,13 +201,14 @@ final class AppModel: ObservableObject {
         }
         let displayID = selectedDisplayID ?? CGMainDisplayID()
         let windowID = sourceKind == .window ? selectedWindowID : nil
-        guard sourceKind == .display ? selectedDisplayID != nil : windowID != nil else {
+        guard sourceKind == .window ? windowID != nil : selectedDisplayID != nil else {
             errorMessage = "Choose a \(sourceKind.rawValue.lowercased()) before recording."
             return
         }
         let configuration = RecordingConfiguration(
             displayID: displayID,
             windowID: windowID,
+            normalizedCropRect: sourceKind == .area ? captureRegionNormalized : nil,
             resolution: resolution,
             frameRate: frameRate,
             codec: .hevc,
@@ -265,6 +268,22 @@ final class AppModel: ObservableObject {
         panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         await openProject(at: url)
+    }
+
+    func chooseMediaToImport() async {
+        let panel = NSOpenPanel()
+        panel.title = "Import Video"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
+        do {
+            let projectURL = try await projectStore.importVideo(from: sourceURL)
+            await openProject(at: projectURL)
+        } catch {
+            errorMessage = "Could not import video: \(error.localizedDescription)"
+        }
     }
 
     func openProject(at url: URL) async {

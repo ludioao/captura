@@ -70,7 +70,9 @@ struct FloatingProjectPreview: View {
                 cursorSample: currentCursorSample,
                 cursorAppearance: openProject.project.settings.cursor ?? .default,
                 caption: activeCaption,
-                cameraFrame: currentCameraFrame
+                cameraFrame: currentCameraFrame,
+                overlays: openProject.project.overlays ?? [],
+                timelineTime: playback.currentTime
             )
             .frame(width: 520, height: 292)
             HStack {

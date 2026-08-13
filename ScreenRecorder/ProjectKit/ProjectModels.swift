@@ -189,6 +189,94 @@ struct OverlayRegion: Codable, Identifiable, Hashable, Sendable {
     var kind: OverlayRegionKind
 }
 
+struct WebcamLayoutKeyframe: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var time: Double
+    var positionX: Double
+    var positionY: Double
+    var width: Double
+    var height: Double
+    var opacity: Double = 1
+    var easing: CameraEasing = .easeInOut
+
+    static func pictureInPicture(at time: Double, appearance: CanvasAppearance) -> WebcamLayoutKeyframe {
+        WebcamLayoutKeyframe(
+            time: time,
+            positionX: appearance.cameraPositionX,
+            positionY: appearance.cameraPositionY,
+            width: appearance.cameraWidth,
+            height: appearance.cameraHeight
+        )
+    }
+
+    static func focused(at time: Double) -> WebcamLayoutKeyframe {
+        WebcamLayoutKeyframe(
+            time: time,
+            positionX: 0.5,
+            positionY: 0.5,
+            width: 0.92,
+            height: 0.92,
+            easing: .spring
+        )
+    }
+}
+
+struct WebcamLayoutInterpolator: Sendable {
+    func value(
+        at time: Double,
+        frames: [WebcamLayoutKeyframe],
+        fallback: CanvasAppearance
+    ) -> WebcamLayoutKeyframe {
+        let sorted = frames.sorted { $0.time < $1.time }
+        guard !sorted.isEmpty else { return .pictureInPicture(at: time, appearance: fallback) }
+        guard let nextIndex = sorted.firstIndex(where: { $0.time >= time }) else {
+            var last = sorted[sorted.count - 1]
+            last.time = time
+            return last
+        }
+        guard nextIndex > 0 else { return sorted[0] }
+        let previous = sorted[nextIndex - 1]
+        let next = sorted[nextIndex]
+        let span = max(next.time - previous.time, .ulpOfOne)
+        var amount = min(max((time - previous.time) / span, 0), 1)
+        if next.easing != .linear { amount = amount * amount * (3 - 2 * amount) }
+        return WebcamLayoutKeyframe(
+            time: time,
+            positionX: previous.positionX + (next.positionX - previous.positionX) * amount,
+            positionY: previous.positionY + (next.positionY - previous.positionY) * amount,
+            width: previous.width + (next.width - previous.width) * amount,
+            height: previous.height + (next.height - previous.height) * amount,
+            opacity: previous.opacity + (next.opacity - previous.opacity) * amount,
+            easing: next.easing
+        )
+    }
+
+    func focusSegment(
+        at startTime: Double,
+        duration: Double,
+        frames: [WebcamLayoutKeyframe],
+        fallback: CanvasAppearance,
+        projectDuration: Double
+    ) -> [WebcamLayoutKeyframe] {
+        let start = min(max(startTime, 0), projectDuration)
+        let end = min(projectDuration, start + max(duration, 1))
+        let transition = min(0.35, max(0.12, (end - start) * 0.2))
+        let previous = value(at: start, frames: frames, fallback: fallback)
+        return [
+            WebcamLayoutKeyframe(
+                time: start, positionX: previous.positionX, positionY: previous.positionY,
+                width: previous.width, height: previous.height, opacity: previous.opacity, easing: .easeInOut
+            ),
+            .focused(at: min(end, start + transition)),
+            .focused(at: max(start, end - transition)),
+            WebcamLayoutKeyframe(
+                time: end, positionX: previous.positionX, positionY: previous.positionY,
+                width: previous.width, height: previous.height, opacity: previous.opacity, easing: .easeInOut
+            )
+        ]
+    }
+}
+
 struct RecordingMetadata: Codable, Hashable, Sendable {
     var eventsPath: String
     var eventCount: Int
@@ -209,6 +297,7 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var timeline: Timeline
     var captions: [CaptionCue]? = nil
     var overlays: [OverlayRegion]? = nil
+    var webcamKeyframes: [WebcamLayoutKeyframe]? = nil
 }
 
 struct CapturaPreset: Codable, Identifiable, Hashable, Sendable {

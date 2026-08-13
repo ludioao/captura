@@ -161,9 +161,27 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 frames: instruction.project.cameraKeyframes
             )
             let cursor = cursorSample(at: sourceTime, instruction: instruction)
-            let colors = backgroundColors(instruction.project.settings.appearance ?? .default)
+            let appearance = instruction.project.settings.appearance ?? .default
+            let colors = backgroundColors(appearance)
             let geometry = instruction.geometry
             let outputSize = geometry.outputSize
+            let webcamLayout = WebcamLayoutInterpolator().value(
+                at: timelineTime,
+                frames: instruction.project.webcamKeyframes ?? [],
+                fallback: appearance
+            )
+            let cameraWidth = max(2, geometry.screenRect.width * min(max(webcamLayout.width, 0.05), 1))
+            let cameraHeight = max(2, geometry.screenRect.height * min(max(webcamLayout.height, 0.05), 1))
+            let cameraCenter = CGPoint(
+                x: geometry.screenRect.minX + geometry.screenRect.width * min(max(webcamLayout.positionX, 0), 1),
+                y: geometry.screenRect.minY + geometry.screenRect.height * min(max(webcamLayout.positionY, 0), 1)
+            )
+            let cameraRect = CGRect(
+                x: cameraCenter.x - cameraWidth / 2,
+                y: cameraCenter.y - cameraHeight / 2,
+                width: cameraWidth,
+                height: cameraHeight
+            ).intersection(geometry.screenRect)
             let normalize: (CGRect) -> SIMD4<Float> = { rect in
                 SIMD4(
                     Float(rect.minX / outputSize.width), Float(rect.minY / outputSize.height),
@@ -175,10 +193,11 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 backgroundEnd: colors.1,
                 windowRect: normalize(geometry.windowRect),
                 screenRect: normalize(geometry.screenRect),
-                cameraRect: normalize(geometry.cameraRect),
+                cameraRect: normalize(cameraRect),
                 cameraFocus: SIMD4(
                     Float(keyframe?.centerX ?? 0.5), Float(keyframe?.centerY ?? 0.5),
-                    Float(max(1, keyframe?.scale ?? 1)), camera == nil ? 0 : 1
+                    Float(max(1, keyframe?.scale ?? 1)),
+                    camera == nil ? 0 : Float(min(max(webcamLayout.opacity, 0), 1))
                 ),
                 cursor: SIMD4(
                     Float(cursor?.normalizedX ?? 0.5), Float(cursor?.normalizedY ?? 0.5),
@@ -384,7 +403,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 cameraUV.y = (cameraUV.y - 0.5) * sourceAspect / destinationAspect + 0.5;
             }
             float4 cameraColor = camera.sample(s, cameraUV);
-            color = mix(color, cameraColor, cameraMask);
+            color = mix(color, cameraColor, cameraMask * u.cameraFocus.w);
         }
 
         if (u.chrome.x > 0.5 && inside(uv, float4(u.windowRect.xy, u.windowRect.z, u.screenRect.y - u.windowRect.y))) {

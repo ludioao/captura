@@ -207,6 +207,7 @@ struct EditorView: View {
             TimelineCanvas(
                 timeline: project.timeline,
                 cameraKeyframes: project.cameraKeyframes,
+                webcamKeyframes: project.webcamKeyframes ?? [],
                 events: openProject.events,
                 waveform: waveform,
                 playhead: playback.currentTime,
@@ -215,7 +216,7 @@ struct EditorView: View {
                 select: { selectedClipID = $0 },
                 moveCameraKeyframe: moveCameraKeyframe
             )
-            .frame(height: 190)
+            .frame(height: 225)
             .padding(.horizontal, 20)
             .padding(.bottom, 8)
             eventSummary
@@ -437,6 +438,13 @@ struct EditorView: View {
         )
     }
 
+    private var webcamKeyframesBinding: Binding<[WebcamLayoutKeyframe]> {
+        Binding(
+            get: { project.webcamKeyframes ?? [] },
+            set: { project.webcamKeyframes = $0.sorted { $0.time < $1.time }; hasUnsavedChanges = true }
+        )
+    }
+
     private var currentCursorSample: CursorSample? {
         let sourceTime = project.timeline.sourceTime(at: playback.currentTime) ?? playback.currentTime
         let samples = openProject.events.compactMap { event -> CursorSample? in
@@ -491,6 +499,15 @@ struct EditorView: View {
                     sourceTime: project.timeline.sourceTime(at: playback.currentTime) ?? playback.currentTime,
                     duration: sourceDuration,
                     seekToSourceTime: seekToSourceTime
+                )
+            case .webcam:
+                WebcamFocusInspector(
+                    keyframes: webcamKeyframesBinding,
+                    appearance: project.settings.appearance ?? .default,
+                    playhead: playback.currentTime,
+                    duration: project.duration,
+                    hasCamera: playback.cameraPlayer != nil,
+                    seek: playback.seek
                 )
             case .captions:
                 CaptionInspector(
@@ -838,7 +855,7 @@ private enum ExportPreset: String, CaseIterable, Identifiable {
 }
 
 private enum EditorInspectorSection: String, CaseIterable, Identifiable {
-    case canvas, audio, cursor, zoom, captions, overlays
+    case canvas, audio, cursor, zoom, webcam, captions, overlays
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -846,6 +863,7 @@ private enum EditorInspectorSection: String, CaseIterable, Identifiable {
         case .audio: "waveform"
         case .cursor: "cursorarrow.motionlines"
         case .zoom: "viewfinder"
+        case .webcam: "person.crop.rectangle"
         case .captions: "captions.bubble"
         case .overlays: "rectangle.dashed"
         }
@@ -1020,6 +1038,121 @@ private struct ZoomInspector: View {
     }
 }
 
+private struct WebcamFocusInspector: View {
+    @Binding var keyframes: [WebcamLayoutKeyframe]
+    let appearance: CanvasAppearance
+    let playhead: Double
+    let duration: Double
+    let hasCamera: Bool
+    let seek: (Double) -> Void
+    @State private var focusDuration = 5.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Webcam focus").font(.headline)
+                Text("Create a segment that expands the webcam, holds it, and returns to its previous layout.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+
+            if !hasCamera {
+                ContentUnavailableView("No webcam track", systemImage: "video.slash")
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    LabeledContent("Focus duration", value: String(format: "%.1fs", focusDuration))
+                    Slider(value: $focusDuration, in: 1...15, step: 0.5)
+                    HStack {
+                        Button("Focus here") { addFocusSegment() }
+                            .buttonStyle(.borderedProminent)
+                        Button("Keyframe") { addCurrentKeyframe() }
+                    }
+                }
+                .padding(.horizontal, 16)
+
+                if keyframes.isEmpty {
+                    ContentUnavailableView(
+                        "Static webcam",
+                        systemImage: "person.crop.rectangle",
+                        description: Text("Move the playhead and choose Focus here.")
+                    )
+                } else {
+                    List {
+                        ForEach(keyframes.indices, id: \.self) { index in
+                            keyframeRow(index)
+                        }
+                    }
+                    .listStyle(.inset)
+                }
+            }
+        }
+    }
+
+    private func addFocusSegment() {
+        let generated = WebcamLayoutInterpolator().focusSegment(
+            at: playhead,
+            duration: focusDuration,
+            frames: keyframes,
+            fallback: appearance,
+            projectDuration: duration
+        )
+        let range = playhead...(min(duration, playhead + focusDuration))
+        keyframes.removeAll { range.contains($0.time) }
+        keyframes.append(contentsOf: generated)
+        keyframes.sort { $0.time < $1.time }
+    }
+
+    private func addCurrentKeyframe() {
+        var value = WebcamLayoutInterpolator().value(at: playhead, frames: keyframes, fallback: appearance)
+        value.id = UUID()
+        value.time = playhead
+        keyframes.removeAll { abs($0.time - playhead) < 0.08 }
+        keyframes.append(value)
+        keyframes.sort { $0.time < $1.time }
+    }
+
+    @ViewBuilder
+    private func keyframeRow(_ index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Button { seek(keyframes[index].time) } label: {
+                    Label(String(format: "%.2fs", keyframes[index].time), systemImage: "diamond.fill")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Button(role: .destructive) { keyframes.remove(at: index) } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+            }
+            LabeledContent("Time", value: String(format: "%.2fs", keyframes[index].time))
+            Slider(value: $keyframes[index].time, in: 0...max(duration, 0.1))
+            LabeledContent("Width", value: "\(Int(keyframes[index].width * 100))%")
+            Slider(value: $keyframes[index].width, in: 0.08...1)
+            LabeledContent("Height", value: "\(Int(keyframes[index].height * 100))%")
+            Slider(value: $keyframes[index].height, in: 0.08...1)
+            HStack {
+                Text("X")
+                Slider(value: $keyframes[index].positionX, in: 0...1)
+                Text("Y")
+                Slider(value: $keyframes[index].positionY, in: 0...1)
+            }
+            Toggle("Visible", isOn: Binding(
+                get: { keyframes[index].opacity > 0.5 },
+                set: { keyframes[index].opacity = $0 ? 1 : 0 }
+            ))
+            Picker("Easing", selection: $keyframes[index].easing) {
+                Text("Linear").tag(CameraEasing.linear)
+                Text("Smooth").tag(CameraEasing.easeInOut)
+                Text("Spring").tag(CameraEasing.spring)
+            }
+        }
+        .padding(.vertical, 5)
+    }
+}
+
 private struct CaptionInspector: View {
     let captions: [CaptionCue]
     let add: () -> Void
@@ -1076,6 +1209,7 @@ private struct CaptionInspector: View {
 private struct TimelineCanvas: View {
     let timeline: Timeline
     let cameraKeyframes: [CameraKeyframe]
+    let webcamKeyframes: [WebcamLayoutKeyframe]
     let events: [InteractionEvent]
     let waveform: [Double]
     let playhead: Double
@@ -1124,7 +1258,9 @@ private struct TimelineCanvas: View {
     private func draw(in context: inout GraphicsContext, size: CGSize) {
         let duration = max(timeline.duration, 0.001)
         let trackWidth = max(1, size.width - labelWidth - 12)
-        let rows: [(String, Double)] = [("VIDEO", 38), ("CAMERA", 73), ("CURSOR", 108), ("AUDIO", 143)]
+        let rows: [(String, Double)] = [
+            ("VIDEO", 38), ("ZOOM", 73), ("WEBCAM", 108), ("CURSOR", 143), ("AUDIO", 178)
+        ]
         for (label, y) in rows {
             context.draw(Text(label).font(.caption2).foregroundStyle(.secondary), at: CGPoint(x: 34, y: y + 11))
             let lane = CGRect(x: labelWidth, y: y, width: trackWidth, height: 23)
@@ -1167,23 +1303,43 @@ private struct TimelineCanvas: View {
             context.stroke(handle, with: .color(.purple), lineWidth: 1.5)
         }
 
+        let sortedWebcamKeyframes = webcamKeyframes.sorted { $0.time < $1.time }
+        for (index, frame) in sortedWebcamKeyframes.enumerated() {
+            let x = labelWidth + min(max(frame.time / duration, 0), 1) * trackWidth
+            if index + 1 < sortedWebcamKeyframes.count,
+               frame.width > 0.6 || sortedWebcamKeyframes[index + 1].width > 0.6 {
+                let nextX = labelWidth + min(max(sortedWebcamKeyframes[index + 1].time / duration, 0), 1) * trackWidth
+                let segment = CGRect(x: x, y: 108, width: max(2, nextX - x), height: 23)
+                context.fill(Path(roundedRect: segment, cornerRadius: 3), with: .color(.pink.opacity(0.78)))
+            }
+            let handle = Path { path in
+                path.move(to: CGPoint(x: x, y: 107))
+                path.addLine(to: CGPoint(x: x + 5, y: 119.5))
+                path.addLine(to: CGPoint(x: x, y: 132))
+                path.addLine(to: CGPoint(x: x - 5, y: 119.5))
+                path.closeSubpath()
+            }
+            context.fill(handle, with: .color(.white))
+            context.stroke(handle, with: .color(.pink), lineWidth: 1.5)
+        }
+
         for event in events where event.type == .mouseMove || event.type == .click {
             guard let eventTime = timeline.firstTimelineTime(forSourceTime: event.timestamp) else { continue }
             let x = labelWidth + eventTime / duration * trackWidth
             let height = event.type == .click ? 20.0 : 7.0
             let color: Color = event.type == .click ? .orange : .secondary.opacity(0.4)
-            context.fill(Path(CGRect(x: x, y: 108 + (23 - height) / 2, width: event.type == .click ? 2 : 1, height: height)), with: .color(color))
+            context.fill(Path(CGRect(x: x, y: 143 + (23 - height) / 2, width: event.type == .click ? 2 : 1, height: height)), with: .color(color))
         }
 
         if waveform.isEmpty {
-            context.draw(Text("No audio waveform").font(.caption2).foregroundStyle(.tertiary), at: CGPoint(x: labelWidth + 8, y: 154), anchor: .leading)
+            context.draw(Text("No audio waveform").font(.caption2).foregroundStyle(.tertiary), at: CGPoint(x: labelWidth + 8, y: 189), anchor: .leading)
         } else {
             let audioPath = Path { path in
                 for (index, peak) in waveform.enumerated() {
                     let x = labelWidth + Double(index) / Double(max(1, waveform.count - 1)) * trackWidth
                     let height = max(1, peak * 9)
-                    path.move(to: CGPoint(x: x, y: 154 - height))
-                    path.addLine(to: CGPoint(x: x, y: 154 + height))
+                    path.move(to: CGPoint(x: x, y: 189 - height))
+                    path.addLine(to: CGPoint(x: x, y: 189 + height))
                 }
             }
             context.stroke(audioPath, with: .color(.green.opacity(0.78)), lineWidth: 1)
@@ -1192,7 +1348,7 @@ private struct TimelineCanvas: View {
         let playheadX = labelWidth + min(max(playhead / duration, 0), 1) * trackWidth
         context.stroke(Path { path in
             path.move(to: CGPoint(x: playheadX, y: 24))
-            path.addLine(to: CGPoint(x: playheadX, y: 172))
+            path.addLine(to: CGPoint(x: playheadX, y: 207))
         }, with: .color(.red), lineWidth: 1)
         context.fill(Path(CGRect(x: playheadX - 4, y: 22, width: 8, height: 8)), with: .color(.red))
 

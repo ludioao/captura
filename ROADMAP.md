@@ -94,7 +94,7 @@ Outcome: users can create branded, reusable templates and more complex demos.
 
 - [x] Project presets for canvas, camera, cursor, audio and export settings.
 - [x] Import/export of shareable `.capturapreset` files.
-- Dynamic webcam layouts: hidden, picture-in-picture and fullscreen ranges.
+- [x] Timeline webcam keyframes with hidden, picture-in-picture and focused/fullscreen ranges.
 - [x] Timed privacy and highlight masks for sensitive or important areas.
 - [x] True 5×5 Gaussian blur masks sampled in the Metal compositor.
 - Custom cursor packs and additional macOS/device frames.

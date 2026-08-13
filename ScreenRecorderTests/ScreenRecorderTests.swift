@@ -140,6 +140,24 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(appearance.cameraHeight, 0.33)
     }
 
+    func testWebcamFocusSegmentExpandsHoldsAndReturns() {
+        let appearance = CanvasAppearance.default
+        let interpolator = WebcamLayoutInterpolator()
+        let frames = interpolator.focusSegment(
+            at: 2,
+            duration: 4,
+            frames: [],
+            fallback: appearance,
+            projectDuration: 10
+        )
+
+        XCTAssertEqual(frames.count, 4)
+        XCTAssertEqual(frames.first?.time, 2)
+        XCTAssertEqual(frames.last?.time, 6)
+        XCTAssertEqual(interpolator.value(at: 3, frames: frames, fallback: appearance).width, 0.92, accuracy: 0.001)
+        XCTAssertEqual(interpolator.value(at: 6, frames: frames, fallback: appearance).width, appearance.cameraWidth, accuracy: 0.001)
+    }
+
     func testProjectStoreUpdatePersistsTimelineWithoutTouchingMedia() async throws {
         let testDirectory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -337,6 +355,43 @@ final class ScreenRecorderTests: XCTestCase {
         defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
         let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
         XCTAssertNotEqual(bytes[0], bytes[CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4])
+    }
+
+    func testMetalProjectRendererFocusesWebcamAtKeyframe() throws {
+        let source = try makeMetalPixelBuffer(width: 96, height: 54, value: 0x42)
+        let camera = try makeMetalPixelBuffer(width: 48, height: 48, value: 0xD4)
+        let destination = try makeMetalPixelBuffer(width: 192, height: 108, value: 0)
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 96, height: 54)
+        project.settings.appearance = .default
+        project.webcamKeyframes = [.focused(at: 0)]
+        let geometry = ExportGeometry(
+            outputSize: CGSize(width: 192, height: 108),
+            sourceSize: project.settings.canvas,
+            appearance: .default
+        )
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 1, preferredTimescale: 600)),
+            screenTrackID: 1,
+            cameraTrackID: 2,
+            project: project,
+            events: [],
+            geometry: geometry
+        )
+
+        try MetalProjectRenderer().render(
+            source: source,
+            camera: camera,
+            destination: destination,
+            compositionTime: CMTime(seconds: 0.5, preferredTimescale: 600),
+            instruction: instruction
+        )
+
+        CVPixelBufferLockBaseAddress(destination, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+        let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
+        let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
+        XCTAssertEqual(bytes[center], 0xD4, accuracy: 2)
     }
 
     func testMetalPreviewUsesSharedVideoCompositor() async throws {

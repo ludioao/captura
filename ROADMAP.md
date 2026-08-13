@@ -28,6 +28,7 @@ Reference reviewed: <https://screen.studio/> and its public changelog on 2026-08
 - Automatic/manual zoom playback and export, debounced autosave and export disk-space preflight.
 - Display, window and interactive area capture plus MOV/MP4 import into editable projects.
 - Timed privacy masks/highlights and explicit on-device transcript generation.
+- Metal zero-copy render core for IOSurface-backed frames with GPU zoom/pan and cursor composition.
 
 ## M1 — Complete the shippable editor
 
@@ -39,7 +40,8 @@ Outcome: a user records, edits and exports a polished MP4 without leaving Captur
 - [x] Horizontal 16:9, square 1:1, portrait 9:16 and social 4:5 output.
 - [x] Export status, cancellation and actionable failures.
 - [x] Continuous export progress and disk-space preflight.
-- [ ] Metal compositor and pixel-perfect preview parity for every effect.
+- [x] Metal frame core, texture cache, shader pipeline and IOSurface output.
+- [ ] Route the complete canvas/webcam/effect graph through Metal for pixel-perfect preview/export parity.
 - Quick export using the last successful settings.
 
 Acceptance:

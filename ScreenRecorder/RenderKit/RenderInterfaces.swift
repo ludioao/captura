@@ -2,7 +2,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-/// The future Metal compositor consumes pixel buffers without converting them to images.
+/// The Metal compositor consumes pixel buffers without converting them to images.
 protocol FrameCompositor: Sendable {
     func render(
         source: CVPixelBuffer,

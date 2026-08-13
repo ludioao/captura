@@ -221,6 +221,27 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(value.scale, 1.5, accuracy: 0.001)
     }
 
+    func testMetalCompositorRendersIOSurfaceBackedFrame() async throws {
+        let compositor: MetalFrameCompositor
+        do { compositor = try MetalFrameCompositor() }
+        catch { throw XCTSkip("Metal unavailable: \(error.localizedDescription)") }
+        let source = try makeMetalPixelBuffer(width: 64, height: 36, value: 0x62)
+        let output = try await compositor.render(
+            source: source,
+            at: .zero,
+            camera: CameraKeyframe(time: 0, centerX: 0.5, centerY: 0.5, scale: 1.4, easing: .linear),
+            cursor: CursorSample(time: 0, normalizedX: 0.5, normalizedY: 0.5, cursorType: .arrow)
+        )
+
+        XCTAssertEqual(CVPixelBufferGetWidth(output), 64)
+        XCTAssertEqual(CVPixelBufferGetHeight(output), 36)
+        XCTAssertEqual(CVPixelBufferGetPixelFormatType(output), kCVPixelFormatType_32BGRA)
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+        let data = try XCTUnwrap(CVPixelBufferGetBaseAddress(output))
+        XCTAssertNotEqual(data.assumingMemoryBound(to: UInt8.self)[0], 0)
+    }
+
     func testLegacyTimelineClipDefaultsToNormalSpeed() throws {
         let id = UUID()
         let mediaID = UUID()
@@ -412,5 +433,24 @@ final class ScreenRecorderTests: XCTestCase {
         if writer.status != .completed {
             throw writer.error ?? NSError(domain: "CapturaTests", code: -1)
         }
+    }
+
+    private func makeMetalPixelBuffer(width: Int, height: Int, value: UInt8) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        let result = CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary, &pixelBuffer
+        )
+        guard result == kCVReturnSuccess, let pixelBuffer else {
+            throw NSError(domain: "CapturaTests", code: Int(result))
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        memset(CVPixelBufferGetBaseAddress(pixelBuffer), Int32(value), CVPixelBufferGetDataSize(pixelBuffer))
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        return pixelBuffer
     }
 }

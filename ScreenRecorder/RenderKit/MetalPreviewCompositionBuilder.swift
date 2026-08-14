@@ -69,6 +69,46 @@ enum MetalPreviewCompositionBuilder {
         }
         guard destination > .zero else { throw ExportError.compositionFailed("The preview timeline is empty.") }
 
+        let audioSettings = project.settings.audio ?? .default
+        var mixParameters = try audioTracks.enumerated().map { index, track in
+            let parameters = AVMutableAudioMixInputParameters(track: track)
+            let isSystemAudio = index == 0
+            let muted = isSystemAudio ? audioSettings.systemMuted : audioSettings.microphoneMuted
+            let volume = isSystemAudio ? audioSettings.systemVolume : audioSettings.microphoneVolume
+            parameters.setVolume(muted ? 0 : Float(volume), at: .zero)
+            if !isSystemAudio && (audioSettings.voiceEnhancement || audioSettings.noiseReduction) {
+                parameters.audioTapProcessor = try VoiceProcessingAudioTap.make(
+                    voiceEnhancement: audioSettings.voiceEnhancement,
+                    noiseReduction: audioSettings.noiseReduction
+                )
+            }
+            return parameters
+        }
+        for item in project.audioAssets ?? [] {
+            let asset = AVURLAsset(url: packageURL.appending(path: item.assetPath))
+            guard let source = try await asset.loadTracks(withMediaType: .audio).first,
+                  let track = composition.addMutableTrack(
+                    withMediaType: .audio,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                  ) else { continue }
+            let requested = CMTimeRange(
+                start: CMTime(seconds: max(0, item.sourceStart), preferredTimescale: 48_000),
+                duration: CMTime(seconds: max(0.05, item.duration), preferredTimescale: 48_000)
+            )
+            var range = CMTimeRangeGetIntersection(requested, otherRange: try await source.load(.timeRange))
+            let start = CMTime(seconds: max(0, item.startTime), preferredTimescale: 48_000)
+            let remaining = CMTimeSubtract(destination, start)
+            if range.duration > remaining { range.duration = remaining }
+            guard range.duration > .zero, start < destination else { continue }
+            try track.insertTimeRange(range, of: source, at: start)
+            mixParameters.append(MusicAudioMix.parameters(
+                track: track,
+                item: item,
+                insertedDuration: range.duration.seconds,
+                narration: project.captions ?? []
+            ))
+        }
+
         let appearance = project.settings.appearance ?? .default
         let size = CGSize(width: project.settings.canvas.width, height: project.settings.canvas.height)
         let geometry = ExportGeometry(outputSize: size, sourceSize: project.settings.canvas, appearance: appearance)
@@ -88,6 +128,11 @@ enum MetalPreviewCompositionBuilder {
 
         let item = AVPlayerItem(asset: composition)
         item.videoComposition = videoComposition
+        if !mixParameters.isEmpty {
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = mixParameters
+            item.audioMix = mix
+        }
         return item
     }
 }

@@ -275,6 +275,34 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             }
         }
 
+        var musicMixParameters: [AVMutableAudioMixInputParameters] = []
+        for item in project.audioAssets ?? [] {
+            let asset = AVURLAsset(url: packageURL.appending(path: item.assetPath))
+            guard let source = try await asset.loadTracks(withMediaType: .audio).first,
+                  let track = composition.addMutableTrack(
+                    withMediaType: .audio,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                  ) else { continue }
+            let available = try await source.load(.timeRange)
+            let requested = CMTimeRange(
+                start: CMTime(seconds: max(0, item.sourceStart), preferredTimescale: 48_000),
+                duration: CMTime(seconds: max(0.05, item.duration), preferredTimescale: 48_000)
+            )
+            var range = CMTimeRangeGetIntersection(requested, otherRange: available)
+            let start = CMTime(seconds: max(0, item.startTime), preferredTimescale: 48_000)
+            let remaining = CMTimeSubtract(destinationCursor, start)
+            if range.duration > remaining { range.duration = remaining }
+            guard range.duration > .zero, start < destinationCursor else { continue }
+            try track.insertTimeRange(range, of: source, at: start)
+
+            musicMixParameters.append(MusicAudioMix.parameters(
+                track: track,
+                item: item,
+                insertedDuration: range.duration.seconds,
+                narration: project.captions ?? []
+            ))
+        }
+
         let outputSize = CGSize(width: settings.resolution.width, height: settings.resolution.height)
         let appearance = project.settings.appearance ?? .default
         let geometry = ExportGeometry(outputSize: outputSize, sourceSize: project.settings.canvas, appearance: appearance)
@@ -320,6 +348,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             parameters.setVolume(Float(audioSettings.clickVolume), at: .zero)
             return parameters
         })
+        mixParameters.append(contentsOf: musicMixParameters)
         let audioMix: AVAudioMix?
         if mixParameters.isEmpty {
             audioMix = nil
@@ -699,7 +728,7 @@ struct ExportGeometry: Sendable {
     init(outputSize: CGSize, sourceSize: CanvasSize, appearance: CanvasAppearance) {
         self.outputSize = outputSize
         scale = min(outputSize.width, outputSize.height) / 720
-        let padding = max(16 * scale, appearance.padding * scale)
+        let padding = max(0, (appearance.padding + appearance.inset) * scale)
         let available = CGRect(x: padding, y: padding, width: max(2, outputSize.width - padding * 2), height: max(2, outputSize.height - padding * 2))
         let sourceAspect = Double(sourceSize.width) / Double(max(1, sourceSize.height))
         let titleRatio = appearance.showsWindowFrame ? MacWindowChromeMetrics.titlebarToWindowWidth : 0

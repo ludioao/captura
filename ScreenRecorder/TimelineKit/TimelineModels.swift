@@ -1,5 +1,11 @@
 import Foundation
 
+enum TimelineEditPosition {
+    static func playhead(_ playhead: Double, within range: ClosedRange<Double>) -> Double {
+        min(max(playhead, range.lowerBound), range.upperBound)
+    }
+}
+
 enum ClipTransitionKind: String, Codable, CaseIterable, Hashable, Sendable {
     case fade
     case flash
@@ -111,9 +117,12 @@ struct Timeline: Codable, Hashable, Sendable {
         return halves.1.id
     }
 
-    mutating func delete(clipID: UUID) {
-        clips.removeAll { $0.id == clipID }
+    @discardableResult
+    mutating func delete(clipID: UUID) -> Bool {
+        guard let index = clips.firstIndex(where: { $0.id == clipID }) else { return false }
+        clips.remove(at: index)
         rippleLayout()
+        return true
     }
 
     mutating func rippleLayout() {
@@ -136,6 +145,24 @@ struct Timeline: Codable, Hashable, Sendable {
             clips.insert(clip, at: index)
         }
         rippleLayout()
+    }
+
+    mutating func remove(timeRanges: [ClosedRange<Double>]) {
+        for range in timeRanges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
+            var result: [TimelineClip] = []
+            for clip in clips {
+                let clipStart = clip.timelineStart
+                let clipEnd = clip.timelineStart + clip.duration
+                let start = max(clipStart, range.lowerBound)
+                let end = min(clipEnd, range.upperBound)
+                guard end > start else { result.append(clip); continue }
+
+                if start > clipStart, let left = clip.split(at: start)?.0 { result.append(left) }
+                if end < clipEnd, let right = clip.split(at: end)?.1 { result.append(right) }
+            }
+            clips = result
+            rippleLayout()
+        }
     }
 
     func clip(at timelineTime: Double) -> TimelineClip? {

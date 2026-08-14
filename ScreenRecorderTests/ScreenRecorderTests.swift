@@ -96,13 +96,36 @@ final class ScreenRecorderTests: XCTestCase {
             appearance: .default,
             audio: ProjectAudioSettings(voiceEnhancement: true, noiseReduction: true, clickSounds: true),
             cursor: .default,
-            export: .mp4(resolution: CanvasSize(width: 1920, height: 1080), fps: 60)
+            export: .mp4(resolution: CanvasSize(width: 1920, height: 1080), fps: 60),
+            brandKit: BrandKit(name: "Captura", primaryHex: "#6610F2", secondaryHex: "#B96CFF")
         )
 
         try CapturaPresetStore.export(preset, to: url)
         let decoded = try CapturaPresetStore.importPreset(from: url)
 
         XCTAssertEqual(decoded, preset)
+    }
+
+    func testAdvancedEditorFeaturesPersistInProject() throws {
+        var project = sampleProject(duration: 12)
+        let textID = UUID()
+        project.brandKit = BrandKit(name: "Acme", primaryHex: "#112233", secondaryHex: "#445566")
+        project.audioAssets = [ProjectAudioAsset(
+            name: "Theme", assetPath: "assets/audio/theme.m4a", startTime: 1, duration: 8
+        )]
+        project.textOverlays = [TextOverlay(
+            id: textID, text: "Launch", startTime: 2, endTime: 6,
+            fontName: "Avenir Next", letterSpacing: 1.5, entrance: .slideUp, exit: .fade
+        )]
+        project.visualKeyframes = [VisualPropertyKeyframe(
+            elementID: textID, elementKind: .text, property: .positionX, time: 3, value: 0.65
+        )]
+        project.layoutSegments = [LayoutSegment(startTime: 4, endTime: 7, layout: .sideBySide)]
+
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: JSONEncoder().encode(project))
+        XCTAssertEqual(decoded, project)
+        XCTAssertEqual(decoded.audioAssets?.first?.fadeOut, 0.8)
+        XCTAssertEqual(decoded.layoutSegments?.first?.layout, .sideBySide)
     }
 
     func testLegacyCanvasAppearanceGetsCameraPlacementDefaults() throws {
@@ -123,6 +146,7 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(appearance.cameraPositionY, 0.78)
         XCTAssertEqual(appearance.cameraWidth, 0.24)
         XCTAssertEqual(appearance.cameraHeight, 0.24)
+        XCTAssertEqual(appearance.cameraShadow, 0)
     }
 
     func testLegacyCameraSizeMigratesToIndependentDimensions() throws {
@@ -238,6 +262,62 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(halves.0.duration + halves.1.duration, clip.duration)
     }
 
+    func testTimelineContextEditUsesCurrentPlayheadExactly() throws {
+        let editTime = TimelineEditPosition.playhead(10, within: 0...30)
+        XCTAssertEqual(editTime, 10, accuracy: 0.000_001)
+
+        let clip = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 0, sourceEnd: 30, timelineStart: 0
+        )
+        let halves = try XCTUnwrap(clip.split(at: editTime))
+        XCTAssertEqual(halves.0.duration, 10, accuracy: 0.000_001)
+        XCTAssertEqual(halves.1.timelineStart, 10, accuracy: 0.000_001)
+    }
+
+    func testSmartEditDetectsAndRemovesSilentPause() {
+        let ranges = SmartEditAnalyzer.silentRanges(
+            waveform: [0.8, 0.7, 0, 0, 0, 0, 0.9, 0.8],
+            duration: 8,
+            threshold: 0.1,
+            minimumDuration: 2,
+            preserveEdge: 0
+        )
+        XCTAssertEqual(ranges, [2...6])
+
+        var timeline = Timeline(clips: [TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 0, sourceEnd: 8, timelineStart: 0
+        )])
+        timeline.remove(timeRanges: ranges)
+        XCTAssertEqual(timeline.clips.count, 2)
+        XCTAssertEqual(timeline.duration, 4, accuracy: 0.000_001)
+        XCTAssertEqual(timeline.clips[1].sourceStart, 6, accuracy: 0.000_001)
+    }
+
+    func testDemoFlowStartsOnCameraThenMovesToChosenFocus() throws {
+        let plan = DemoFlowDirector.makePlan(
+            duration: 20,
+            introDuration: 5,
+            destination: .pictureInPicture,
+            appearance: .default,
+            focusTarget: CGPoint(x: 0.8, y: 0.25),
+            sourceCutTime: 7,
+            destinationCameraFrame: CGRect(x: 0.08, y: 0.12, width: 0.3, height: 0.22)
+        )
+        XCTAssertEqual(plan.layouts.map(\.layout), [.cameraOnly, .pictureInPicture])
+        XCTAssertEqual(plan.layouts[0].endTime, 5)
+        XCTAssertEqual(try XCTUnwrap(plan.webcamKeyframes.first).time, 0, accuracy: 0.001)
+        let landing = try XCTUnwrap(plan.webcamKeyframes.last)
+        XCTAssertEqual(landing.time, 5.45, accuracy: 0.001)
+        XCTAssertEqual(landing.positionX, 0.23, accuracy: 0.001)
+        XCTAssertEqual(landing.positionY, 0.23, accuracy: 0.001)
+        XCTAssertEqual(landing.width, 0.3, accuracy: 0.001)
+        XCTAssertEqual(landing.height, 0.22, accuracy: 0.001)
+        let focus = try XCTUnwrap(plan.cameraKeyframes.last)
+        XCTAssertEqual(focus.centerX, 0.8, accuracy: 0.001)
+        XCTAssertEqual(focus.centerY, 0.25, accuracy: 0.001)
+        XCTAssertEqual(focus.scale, 1.45, accuracy: 0.001)
+    }
+
     func testSplitMovesExistingTransitionToTrailingClip() throws {
         let clip = TimelineClip(
             id: UUID(), sourceMediaID: UUID(), sourceStart: 0, sourceEnd: 10,
@@ -273,6 +353,31 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(first.duration, 6)
         XCTAssertEqual(timeline.clips[1].timelineStart, 6)
         XCTAssertEqual(timeline.duration, 10)
+    }
+
+    func testTimelineDeletesExactlyTheRequestedClipAtEveryPosition() {
+        let sourceID = UUID()
+        let clips = (0..<3).map { index in
+            TimelineClip(
+                id: UUID(), sourceMediaID: sourceID,
+                sourceStart: Double(index * 2), sourceEnd: Double(index * 2 + 2),
+                timelineStart: Double(index * 2)
+            )
+        }
+
+        for targetIndex in clips.indices {
+            var timeline = Timeline(clips: clips)
+            let targetID = clips[targetIndex].id
+
+            XCTAssertTrue(timeline.delete(clipID: targetID))
+            XCTAssertFalse(timeline.clips.contains { $0.id == targetID })
+            XCTAssertEqual(timeline.clips.map(\.id), clips.map(\.id).filter { $0 != targetID })
+            XCTAssertEqual(timeline.clips.map(\.timelineStart), [0, 2])
+        }
+
+        var unchanged = Timeline(clips: clips)
+        XCTAssertFalse(unchanged.delete(clipID: UUID()))
+        XCTAssertEqual(unchanged.clips.map(\.id), clips.map(\.id))
     }
 
     func testTimelineSpeedChangesDurationAndSplitSourcePosition() throws {
@@ -677,12 +782,13 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertLessThan(bytes[center + 2], 100)
     }
 
+    @MainActor
     func testMetalPreviewUsesSharedVideoCompositor() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         let media = directory.appending(path: "media", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        try await makeTestMovie(
+        try await Self.makeTestMovie(
             at: media.appending(path: "screen.mov"),
             size: CGSize(width: 160, height: 90),
             frameCount: 15
@@ -720,7 +826,7 @@ final class ScreenRecorderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = mediaDirectory.appending(path: "screen.mov")
         let destination = directory.appending(path: "export.mp4")
-        try await makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 30)
+        try await Self.makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 30)
 
         var project = sampleProject(duration: 1)
         project.settings.canvas = CanvasSize(width: 320, height: 180)
@@ -759,7 +865,7 @@ final class ScreenRecorderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = mediaDirectory.appending(path: "screen.mov")
         let destination = directory.appending(path: "export.gif")
-        try await makeTestMovie(at: source, size: CGSize(width: 160, height: 90), frameCount: 15)
+        try await Self.makeTestMovie(at: source, size: CGSize(width: 160, height: 90), frameCount: 15)
         var project = sampleProject(duration: 0.5)
         project.settings.canvas = CanvasSize(width: 160, height: 90)
         project.settings.cursor = .default
@@ -787,7 +893,7 @@ final class ScreenRecorderTests: XCTestCase {
         let source = directory.appending(path: "source.mov")
         let projects = directory.appending(path: "projects", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
-        try await makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 15)
+        try await Self.makeTestMovie(at: source, size: CGSize(width: 320, height: 180), frameCount: 15)
 
         let store = ProjectStore()
         let packageURL = try await store.importVideo(from: source, in: projects)
@@ -805,7 +911,7 @@ final class ScreenRecorderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = ProjectStore()
         let package = try await store.createPackage(in: directory)
-        try await makeTestMovie(at: package.screenMediaURL, size: CGSize(width: 320, height: 180), frameCount: 15)
+        try await Self.makeTestMovie(at: package.screenMediaURL, size: CGSize(width: 320, height: 180), frameCount: 15)
         try await store.writeRecoveryManifest(
             RecordingRecoveryManifest(
                 createdAt: Date(),
@@ -965,6 +1071,121 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(frames.last?.scale, 1)
     }
 
+    func testSideBySideGeometrySupportsHorizontalRatioGapAndOrder() {
+        let container = CGRect(x: 0, y: 0, width: 1000, height: 500)
+        let configuration = SideBySideConfiguration(
+            orientation: .horizontal, screenFraction: 0.6, gap: 0.1, screenFirst: false
+        )
+        let result = PresenterLayoutGeometry.resolve(
+            layout: .sideBySide,
+            container: container,
+            baseVideoRect: container,
+            baseCameraRect: .zero,
+            videoAspect: 2,
+            videoContentMode: .fit,
+            sideBySide: configuration
+        )
+
+        XCTAssertEqual(result.cameraRect, CGRect(x: 0, y: 0, width: 360, height: 500))
+        XCTAssertEqual(result.videoRect.minX, 460, accuracy: 0.001)
+        XCTAssertEqual(result.videoRect.width, 540, accuracy: 0.001)
+        XCTAssertEqual(result.videoRect.height, 270, accuracy: 0.001)
+        XCTAssertEqual(result.videoRect.midY, container.midY, accuracy: 0.001)
+    }
+
+    func testSideBySideGeometrySupportsVerticalSplit() {
+        let container = CGRect(x: 0, y: 0, width: 600, height: 900)
+        let result = PresenterLayoutGeometry.resolve(
+            layout: .sideBySide,
+            container: container,
+            baseVideoRect: container,
+            baseCameraRect: .zero,
+            videoAspect: 1,
+            videoContentMode: .fill,
+            sideBySide: SideBySideConfiguration(
+                orientation: .vertical, screenFraction: 0.4, gap: 0.05, screenFirst: true
+            )
+        )
+
+        XCTAssertEqual(result.videoRect, CGRect(x: 0, y: 0, width: 600, height: 342))
+        XCTAssertEqual(result.cameraRect, CGRect(x: 0, y: 387, width: 600, height: 513))
+    }
+
+    func testPresenterLayoutInterpolationMovesAndFadesGeometry() {
+        let start = ResolvedPresenterLayout(
+            videoRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            cameraRect: CGRect(x: 80, y: 80, width: 20, height: 20),
+            videoOpacity: 1,
+            cameraOpacity: 0
+        )
+        let end = ResolvedPresenterLayout(
+            videoRect: CGRect(x: 50, y: 50, width: 50, height: 50),
+            cameraRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            videoOpacity: 0,
+            cameraOpacity: 1
+        )
+        let result = PresenterLayoutGeometry.interpolate(from: start, to: end, progress: 0.5)
+
+        XCTAssertEqual(result.videoRect, CGRect(x: 25, y: 25, width: 75, height: 75))
+        XCTAssertEqual(result.cameraRect, CGRect(x: 40, y: 40, width: 60, height: 60))
+        XCTAssertEqual(result.videoOpacity, 0.5)
+        XCTAssertEqual(result.cameraOpacity, 0.5)
+    }
+
+    func testLegacyLayoutSegmentDecodesWithoutSplitConfiguration() throws {
+        let id = UUID()
+        let json = """
+        {"id":"\(id.uuidString)","startTime":0,"endTime":4,"layout":"sideBySide","transitionDuration":0.35}
+        """.data(using: .utf8)!
+        let segment = try JSONDecoder().decode(LayoutSegment.self, from: json)
+        XCTAssertNil(segment.sideBySide)
+    }
+
+    func testDemoFlowPersistsSideBySideConfiguration() throws {
+        let configuration = SideBySideConfiguration(
+            orientation: .vertical, screenFraction: 0.58, gap: 0.04, screenFirst: false
+        )
+        let plan = DemoFlowDirector.makePlan(
+            duration: 12,
+            introDuration: 3,
+            destination: .sideBySide,
+            appearance: .default,
+            focusTarget: CGPoint(x: 0.5, y: 0.5),
+            sourceCutTime: 3,
+            sideBySideConfiguration: configuration
+        )
+        XCTAssertEqual(try XCTUnwrap(plan.layouts.last?.sideBySide), configuration)
+    }
+
+    func testTimelineRetimerKeepsTimedLayersAligned() throws {
+        var project = sampleProject(duration: 20)
+        project.captions = [CaptionCue(startTime: 2, endTime: 14, text: "Narration")]
+        project.textOverlays = [TextOverlay(text: "Title", startTime: 1, endTime: 16)]
+        project.layoutSegments = [LayoutSegment(startTime: 0, endTime: 20, layout: .sideBySide)]
+        project.audioAssets = [ProjectAudioAsset(
+            name: "Music", assetPath: "media/music.m4a", startTime: 0, duration: 20
+        )]
+
+        ProjectTimelineRetimer.apply(to: &project, removing: [5...10])
+
+        XCTAssertEqual(project.duration, 15, accuracy: 0.001)
+        XCTAssertEqual(project.captions?.map(\.startTime), [2, 5])
+        XCTAssertEqual(project.captions?.map(\.endTime), [5, 9])
+        XCTAssertEqual(project.textOverlays?.count, 2)
+        XCTAssertEqual(project.layoutSegments?.map(\.endTime), [5, 15])
+        XCTAssertEqual(project.audioAssets?.map(\.sourceStart), [0, 10])
+        XCTAssertEqual(project.audioAssets?.map(\.duration), [5, 10])
+    }
+
+    func testMusicDuckingMergesNearbyNarration() {
+        let cues = [
+            CaptionCue(startTime: 1, endTime: 2, text: "A"),
+            CaptionCue(startTime: 2.1, endTime: 3, text: "B"),
+            CaptionCue(startTime: 5, endTime: 6, text: "C")
+        ]
+        XCTAssertEqual(MusicAudioMix.mergedNarration(cues), [1...3, 5...6])
+    }
+
     private func sampleProject(duration: Double) -> ScreenProject {
         let mediaID = UUID()
         return ScreenProject(
@@ -984,7 +1205,7 @@ final class ScreenRecorderTests: XCTestCase {
         )
     }
 
-    private func makeTestMovie(at url: URL, size: CGSize, frameCount: Int) async throws {
+    private static func makeTestMovie(at url: URL, size: CGSize, frameCount: Int) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(
             mediaType: .video,

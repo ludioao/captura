@@ -132,6 +132,9 @@ final class MetalProjectRenderer: @unchecked Sendable {
         var branding: SIMD4<Float>
         var textRect: SIMD4<Float>
         var text: SIMD4<Float>
+        var background: SIMD4<Float>
+        var cameraStyle: SIMD4<Float>
+        var cameraBorderColor: SIMD4<Float>
     }
 
     private struct GPUOverlay {
@@ -196,6 +199,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             let cursor = isPrimaryClip ? cursorSample(at: sourceTime, instruction: instruction) : nil
             let appearance = instruction.project.settings.appearance ?? .default
             let colors = backgroundColors(appearance)
+            let gradientRadians = appearance.gradientAngle * .pi / 180
             let geometry = instruction.geometry
             let outputSize = geometry.outputSize
             let activeTransition = instruction.project.timeline.activeTransition(at: timelineTime)
@@ -208,6 +212,14 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
                 !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultTextID)
             }
+            let layoutSegments = (instruction.project.layoutSegments ?? [])
+                .filter { $0.endTime > $0.startTime }
+                .sorted { lhs, rhs in
+                    lhs.startTime == rhs.startTime ? lhs.endTime < rhs.endTime : lhs.startTime < rhs.startTime
+                }
+            let activeLayoutSegment = layoutSegments.last {
+                timelineTime >= $0.startTime && timelineTime < $0.endTime
+            }
             let webcamLayout = WebcamLayoutInterpolator().value(
                 at: timelineTime,
                 frames: instruction.project.webcamKeyframes ?? [],
@@ -219,7 +231,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 x: geometry.screenRect.minX + geometry.screenRect.width * min(max(webcamLayout.positionX, 0), 1),
                 y: geometry.screenRect.minY + geometry.screenRect.height * min(max(webcamLayout.positionY, 0), 1)
             )
-            let cameraRect = CGRect(
+            let baseCameraRect = CGRect(
                 x: cameraCenter.x - cameraWidth / 2,
                 y: cameraCenter.y - cameraHeight / 2,
                 width: cameraWidth,
@@ -241,19 +253,113 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 if sourceAspect > destinationAspect { relativeHeight *= destinationAspect / sourceAspect }
                 else { relativeWidth *= sourceAspect / destinationAspect }
             }
-            let videoRect = CGRect(
+            let baseVideoRect = CGRect(
                 x: geometry.screenRect.minX + geometry.screenRect.width * (layout.positionX - relativeWidth / 2),
                 y: geometry.screenRect.minY + geometry.screenRect.height * (layout.positionY - relativeHeight / 2),
                 width: geometry.screenRect.width * relativeWidth,
                 height: geometry.screenRect.height * relativeHeight
             )
+            let fallbackLayout = PresenterLayoutGeometry.resolve(
+                layout: .pictureInPicture,
+                container: geometry.screenRect,
+                baseVideoRect: baseVideoRect,
+                baseCameraRect: baseCameraRect,
+                videoAspect: sourceAspect,
+                videoContentMode: layout.contentMode,
+                sideBySide: nil
+            )
+            var resolvedLayout = activeLayoutSegment.map { segment in
+                PresenterLayoutGeometry.resolve(
+                    layout: segment.layout,
+                    container: geometry.screenRect,
+                    baseVideoRect: baseVideoRect,
+                    baseCameraRect: baseCameraRect,
+                    videoAspect: sourceAspect,
+                    videoContentMode: layout.contentMode,
+                    sideBySide: segment.sideBySide
+                )
+            } ?? fallbackLayout
+            if let segment = activeLayoutSegment, segment.transitionDuration > 0 {
+                let previousSegment = layoutSegments.last {
+                    $0.startTime < segment.startTime && $0.endTime <= segment.startTime
+                }
+                let previousLayout = previousSegment.map {
+                    PresenterLayoutGeometry.resolve(
+                        layout: $0.layout,
+                        container: geometry.screenRect,
+                        baseVideoRect: baseVideoRect,
+                        baseCameraRect: baseCameraRect,
+                        videoAspect: sourceAspect,
+                        videoContentMode: layout.contentMode,
+                        sideBySide: $0.sideBySide
+                    )
+                } ?? fallbackLayout
+                let transitionProgress = (timelineTime - segment.startTime) / max(segment.transitionDuration, 0.01)
+                resolvedLayout = PresenterLayoutGeometry.interpolate(
+                    from: previousLayout,
+                    to: resolvedLayout,
+                    progress: transitionProgress
+                )
+            }
+            let videoRect = resolvedLayout.videoRect
+            let cameraRect = resolvedLayout.cameraRect
+            let videoOpacity = min(max(layout.opacity * resolvedLayout.videoOpacity, 0), 1)
+            let cameraOpacity = camera == nil || !isPrimaryClip
+                ? 0
+                : min(max(webcamLayout.opacity * resolvedLayout.cameraOpacity, 0), 1)
             let brandingImage = activeBranding.flatMap { instruction.brandingImages[$0.id] }
             let brandingTexture = activeBranding.flatMap { overlay in
                 cachedBrandingTexture(for: overlay.id, image: brandingImage)
             } ?? sourceTexture
             let brandingAspect = brandingImage.map { Float($0.width) / Float(max(1, $0.height)) } ?? 1
-            let textTexture = activeText.flatMap(cachedTextTexture(for:)) ?? sourceTexture
+            let textAnimation = activeText.map { textAnimationState(for: $0, at: timelineTime) }
+            var renderedText = activeText
+            if var item = renderedText, item.entrance == .typewriter {
+                let progress = textAnimation?.progress ?? 1
+                item.text = String(item.text.prefix(max(1, Int(Double(item.text.count) * progress))))
+                renderedText = item
+            }
+            let textTexture = renderedText.flatMap(cachedTextTexture(for:)) ?? sourceTexture
             let textAspect = Float(4)
+            let brandingRect: SIMD4<Float>
+            let brandingOpacity: Float
+            if let activeBranding {
+                let x = visualValue(for: activeBranding.id, property: .positionX, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedX)
+                let y = visualValue(for: activeBranding.id, property: .positionY, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedY)
+                let width = visualValue(for: activeBranding.id, property: .width, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedWidth)
+                brandingRect = SIMD4(
+                    Float(x - width / 2), Float(y - activeBranding.normalizedHeight / 2),
+                    Float(width), Float(activeBranding.normalizedHeight)
+                )
+                let opacity = visualValue(for: activeBranding.id, property: .opacity, at: timelineTime, project: instruction.project, fallback: activeBranding.opacity)
+                brandingOpacity = brandingImage == nil ? 0 : Float(min(max(opacity, 0), 1))
+            } else {
+                brandingRect = .zero
+                brandingOpacity = 0
+            }
+            let textRect: SIMD4<Float>
+            let textOpacity: Float
+            if let activeText {
+                let keyedScale = visualValue(for: activeText.id, property: .scale, at: timelineTime, project: instruction.project, fallback: 1)
+                let scale = (textAnimation?.scale ?? 1) * keyedScale
+                let baseWidth = visualValue(for: activeText.id, property: .width, at: timelineTime, project: instruction.project, fallback: activeText.normalizedWidth)
+                let x = visualValue(for: activeText.id, property: .positionX, at: timelineTime, project: instruction.project, fallback: activeText.normalizedX)
+                let y = visualValue(for: activeText.id, property: .positionY, at: timelineTime, project: instruction.project, fallback: activeText.normalizedY)
+                let width = min(max(baseWidth * scale, 0.05), 1)
+                let height = width * outputSize.width / max(outputSize.height, 1) / Double(textAspect)
+                textRect = SIMD4(
+                    Float(x - width / 2 + (textAnimation?.offsetX ?? 0)),
+                    Float(y - height / 2 + (textAnimation?.offsetY ?? 0)),
+                    Float(width), Float(height)
+                )
+                let opacity = visualValue(for: activeText.id, property: .opacity, at: timelineTime, project: instruction.project, fallback: activeText.opacity)
+                textOpacity = Float(min(max(opacity * (textAnimation?.opacity ?? 1), 0), 1))
+            } else {
+                textRect = .zero
+                textOpacity = 0
+            }
+            var cameraBorderColor = rgba(appearance.cameraBorderHex)
+            cameraBorderColor.w = Float(min(max(appearance.cameraShadow, 0), 1))
             var uniforms = Uniforms(
                 backgroundStart: colors.0,
                 backgroundEnd: colors.1,
@@ -263,7 +369,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 cameraFocus: SIMD4(
                     Float(keyframe?.centerX ?? 0.5), Float(keyframe?.centerY ?? 0.5),
                     Float(max(1, keyframe?.scale ?? 1)),
-                    camera == nil || !isPrimaryClip ? 0 : Float(min(max(webcamLayout.opacity, 0), 1))
+                    Float(cameraOpacity)
                 ),
                 cursor: SIMD4(
                     Float(cursor?.normalizedX ?? 0.5), Float(cursor?.normalizedY ?? 0.5),
@@ -283,36 +389,31 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 ),
                 videoRect: normalize(videoRect),
                 video: SIMD4(
-                    Float(min(max(layout.opacity, 0), 1)),
+                    Float(videoOpacity),
                     layout.contentMode == .fill ? 1 : 0,
                     Float(sourceAspect),
                     Float(importedMedia?.rotationQuarterTurns ?? 0)
                 ),
-                brandingRect: activeBranding.map {
-                    SIMD4(
-                        Float($0.normalizedX - $0.normalizedWidth / 2),
-                        Float($0.normalizedY - $0.normalizedHeight / 2),
-                        Float($0.normalizedWidth), Float($0.normalizedHeight)
-                    )
-                } ?? .zero,
+                brandingRect: brandingRect,
                 branding: SIMD4(
-                    brandingImage == nil ? 0 : Float(min(max(activeBranding?.opacity ?? 0, 0), 1)),
+                    brandingOpacity,
                     activeBranding?.contentMode == .fill ? 1 : 0,
                     brandingAspect,
                     Float(activeBranding?.cornerRadius ?? 0)
                 ),
-                textRect: activeText.map {
-                    let width = min(max($0.normalizedWidth, 0.05), 1)
-                    let height = width * outputSize.width / max(outputSize.height, 1) / Double(textAspect)
-                    return SIMD4(
-                        Float($0.normalizedX - width / 2), Float($0.normalizedY - height / 2),
-                        Float(width), Float(height)
-                    )
-                } ?? .zero,
-                text: SIMD4(
-                    activeText == nil ? 0 : Float(min(max(activeText?.opacity ?? 0, 0), 1)),
-                    0, 0, 0
-                )
+                textRect: textRect,
+                text: SIMD4(textOpacity, 0, 0, 0),
+                background: SIMD4(
+                    Float(cos(gradientRadians)), Float(sin(gradientRadians)),
+                    Float(min(max(appearance.vignette, 0), 1)), 0
+                ),
+                cameraStyle: SIMD4(
+                    cameraShapeCode(appearance.cameraShape),
+                    Float(min(max(appearance.cameraCornerRadius, 0), 0.5)),
+                    Float(max(0, appearance.cameraBorderWidth) / max(outputSize.width, 1)),
+                    appearance.cameraMirrored ? 1 : 0
+                ),
+                cameraBorderColor: cameraBorderColor
             )
             var overlays = activeOverlays(at: timelineTime, instruction: instruction)
             if overlays.isEmpty {
@@ -356,6 +457,27 @@ final class MetalProjectRenderer: @unchecked Sendable {
         return CVMetalTextureGetTexture(image)
     }
 
+    private func visualValue(
+        for elementID: UUID,
+        property: AnimatableVisualProperty,
+        at time: Double,
+        project: ScreenProject,
+        fallback: Double
+    ) -> Double {
+        let frames = (project.visualKeyframes ?? [])
+            .filter { $0.elementID == elementID && $0.property == property }
+            .sorted { $0.time < $1.time }
+        guard !frames.isEmpty else { return fallback }
+        guard let next = frames.firstIndex(where: { $0.time >= time }) else { return frames.last?.value ?? fallback }
+        guard next > 0 else { return frames[next].value }
+        let left = frames[next - 1]
+        let right = frames[next]
+        let span = max(right.time - left.time, .ulpOfOne)
+        var progress = min(max((time - left.time) / span, 0), 1)
+        if right.easing != .linear { progress = progress * progress * (3 - 2 * progress) }
+        return left.value + (right.value - left.value) * progress
+    }
+
     private func cachedBrandingTexture(for id: UUID, image: CGImage?) -> MTLTexture? {
         if let cached = brandingTextureCache[id] { return cached }
         guard let image,
@@ -391,52 +513,91 @@ final class MetalProjectRenderer: @unchecked Sendable {
         context.addPath(CGPath(roundedRect: CGRect(x: 12, y: 12, width: width - 24, height: height - 24), cornerWidth: 34, cornerHeight: 34, transform: nil))
         context.fillPath()
 
-        let fontName: CFString = switch item.weight {
+        let fallbackFontName: CFString = switch item.weight {
         case .regular: "SFProDisplay-Regular" as CFString
         case .medium: "SFProDisplay-Medium" as CFString
         case .semibold: "SFProDisplay-Semibold" as CFString
         case .bold: "SFProDisplay-Bold" as CFString
         }
-        let font = CTFontCreateWithName(fontName, CGFloat(min(max(item.fontSize, 18), 144)), nil)
+        let font = CTFontCreateWithName((item.fontName as CFString?) ?? fallbackFontName, CGFloat(min(max(item.fontSize, 18), 144)), nil)
         var alignment: CTTextAlignment = switch item.alignment {
         case .left: .left
         case .center: .center
         case .right: .right
         }
         var lineBreak = CTLineBreakMode.byWordWrapping
+        var lineHeight = CGFloat(item.fontSize * min(max(item.lineHeight ?? 1, 0.8), 2))
         let paragraph = withUnsafePointer(to: &alignment) { alignmentPointer in
             withUnsafePointer(to: &lineBreak) { lineBreakPointer in
-                let settings = [
-                    CTParagraphStyleSetting(
-                        spec: .alignment,
-                        valueSize: MemoryLayout<CTTextAlignment>.size,
-                        value: alignmentPointer
-                    ),
-                    CTParagraphStyleSetting(
-                        spec: .lineBreakMode,
-                        valueSize: MemoryLayout<CTLineBreakMode>.size,
-                        value: lineBreakPointer
-                    )
-                ]
-                return CTParagraphStyleCreate(settings, settings.count)
+                withUnsafePointer(to: &lineHeight) { lineHeightPointer in
+                    let settings = [
+                        CTParagraphStyleSetting(
+                            spec: .alignment,
+                            valueSize: MemoryLayout<CTTextAlignment>.size,
+                            value: alignmentPointer
+                        ),
+                        CTParagraphStyleSetting(
+                            spec: .lineBreakMode,
+                            valueSize: MemoryLayout<CTLineBreakMode>.size,
+                            value: lineBreakPointer
+                        ),
+                        CTParagraphStyleSetting(spec: .minimumLineHeight, valueSize: MemoryLayout<CGFloat>.size, value: lineHeightPointer),
+                        CTParagraphStyleSetting(spec: .maximumLineHeight, valueSize: MemoryLayout<CGFloat>.size, value: lineHeightPointer)
+                    ]
+                    return CTParagraphStyleCreate(settings, settings.count)
+                }
             }
         }
-        let attributed = NSAttributedString(
-            string: item.text,
-            attributes: [
+        var attributes: [NSAttributedString.Key: Any] = [
                 kCTFontAttributeName as NSAttributedString.Key: font,
                 kCTForegroundColorAttributeName as NSAttributedString.Key: cgColor(item.foregroundHex, alpha: 1),
-                kCTParagraphStyleAttributeName as NSAttributedString.Key: paragraph
-            ]
-        )
+                kCTParagraphStyleAttributeName as NSAttributedString.Key: paragraph,
+                kCTKernAttributeName as NSAttributedString.Key: item.letterSpacing ?? 0
+        ]
+        if (item.strokeWidth ?? 0) > 0 {
+            attributes[kCTStrokeColorAttributeName as NSAttributedString.Key] = cgColor(item.strokeHex ?? "#000000", alpha: 1)
+            attributes[kCTStrokeWidthAttributeName as NSAttributedString.Key] = -(item.strokeWidth ?? 0)
+        }
+        let attributed = NSAttributedString(string: item.text, attributes: attributes)
         let framesetter = CTFramesetterCreateWithAttributedString(attributed)
         context.saveGState()
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
+        if (item.shadowOpacity ?? 0) > 0 {
+            context.setShadow(offset: CGSize(width: 0, height: 8), blur: 14, color: cgColor("#000000", alpha: item.shadowOpacity ?? 0))
+        }
         let path = CGPath(rect: CGRect(x: 72, y: 48, width: width - 144, height: height - 96), transform: nil)
         CTFrameDraw(CTFramesetterCreateFrame(framesetter, CFRange(), path, nil), context)
         context.restoreGState()
         return context.makeImage()
+    }
+
+    private struct TextAnimationState {
+        var opacity = 1.0
+        var offsetX = 0.0
+        var offsetY = 0.0
+        var scale = 1.0
+        var progress = 1.0
+    }
+
+    private func textAnimationState(for item: TextOverlay, at time: Double) -> TextAnimationState {
+        let duration = min(0.45, max(0.12, (item.endTime - item.startTime) * 0.2))
+        let entranceProgress = min(max((time - item.startTime) / duration, 0), 1)
+        let exitProgress = min(max((item.endTime - time) / duration, 0), 1)
+        if entranceProgress < 1 { return animationState(item.entrance ?? .none, progress: entranceProgress) }
+        if exitProgress < 1 { return animationState(item.exit ?? .none, progress: exitProgress) }
+        return TextAnimationState()
+    }
+
+    private func animationState(_ transition: VisualTransition, progress: Double) -> TextAnimationState {
+        let eased = progress * progress * (3 - 2 * progress)
+        return switch transition {
+        case .none: TextAnimationState()
+        case .fade, .typewriter: TextAnimationState(opacity: eased, progress: eased)
+        case .slideUp: TextAnimationState(opacity: eased, offsetY: (1 - eased) * 0.06, progress: eased)
+        case .slideLeft: TextAnimationState(opacity: eased, offsetX: (1 - eased) * 0.08, progress: eased)
+        case .scale: TextAnimationState(opacity: eased, scale: 0.78 + eased * 0.22, progress: eased)
+        }
     }
 
     private func cgColor(_ hex: String, alpha: Double) -> CGColor {
@@ -456,6 +617,15 @@ final class MetalProjectRenderer: @unchecked Sendable {
         case .flash: 2
         case .zoom: 3
         case nil: 0
+        }
+    }
+
+    private func cameraShapeCode(_ shape: CameraFrameShape) -> Float {
+        switch shape {
+        case .circle: 1
+        case .squircle: 2
+        case .roundedRectangle: 3
+        case .rectangle: 4
         }
     }
 
@@ -496,7 +666,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         case .ocean: ("#0B6B78", "#7BDCB5")
         case .sunset: ("#F97356", "#8E4EC6")
         case .graphite: ("#24262B", "#555A65")
-        case .custom: (appearance.customColorHex, appearance.customColorHex)
+        case .custom: (appearance.customGradientStartHex, appearance.customGradientEndHex)
         }
         return (rgba(hexes.0), rgba(hexes.1))
     }
@@ -524,6 +694,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         float4 transition; float4 videoRect; float4 video;
         float4 brandingRect; float4 branding;
         float4 textRect; float4 text;
+        float4 background; float4 cameraStyle; float4 cameraBorderColor;
     };
     struct Overlay { float4 rect; float4 values; };
 
@@ -570,7 +741,10 @@ final class MetalProjectRenderer: @unchecked Sendable {
         constant uint &overlayCount [[buffer(2)]]) {
         constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
         float2 uv = in.uv;
-        float4 color = mix(u.backgroundStart, u.backgroundEnd, clamp((uv.x + uv.y) * 0.5, 0.0, 1.0));
+        float gradient = clamp(0.5 + dot(uv - 0.5, normalize(u.background.xy)) * 0.72, 0.0, 1.0);
+        float4 color = mix(u.backgroundStart, u.backgroundEnd, gradient);
+        float vignette = smoothstep(0.28, 0.78, length((uv - 0.5) * float2(1.0, u.output.y / max(u.output.x, 1.0))));
+        color.rgb *= 1.0 - vignette * u.background.z * 0.62;
 
         float windowMask = roundedMask(uv, u.windowRect, max(u.chrome.y, 0.002));
         float shadow = roundedMask(uv - float2(0, u.chrome.z * 0.45), u.windowRect, max(u.chrome.y, 0.002));
@@ -616,9 +790,29 @@ final class MetalProjectRenderer: @unchecked Sendable {
             }
         }
 
-        if (u.cameraFocus.w > 0.5 && inside(uv, u.cameraRect)) {
-            float cameraMask = roundedMask(uv, u.cameraRect, 0.012);
+        if (u.cameraFocus.w > 0.001 && u.cameraBorderColor.w > 0.001) {
+            float spread = 0.012 * u.cameraBorderColor.w;
+            float4 shadowRect = float4(u.cameraRect.xy - spread, u.cameraRect.zw + spread * 2.0);
+            float shadowMask = roundedMask(uv - float2(0, spread * 0.45), shadowRect, min(shadowRect.z, shadowRect.w) * max(u.cameraStyle.y, 0.08));
+            float cameraBody = roundedMask(uv, u.cameraRect, min(u.cameraRect.z, u.cameraRect.w) * max(u.cameraStyle.y, 0.08));
+            color = mix(color, float4(0,0,0,1), max(0.0, shadowMask - cameraBody) * u.cameraBorderColor.w * 0.34);
+        }
+
+        if (u.cameraFocus.w > 0.001 && inside(uv, u.cameraRect)) {
+            float cameraMask;
+            if (u.cameraStyle.x < 1.5) {
+                float2 cameraCenter = u.cameraRect.xy + u.cameraRect.zw * 0.5;
+                float2 delta = (uv - cameraCenter) / max(u.cameraRect.zw * 0.5, 0.0001);
+                cameraMask = 1.0 - smoothstep(0.985, 1.0, length(delta));
+            } else if (u.cameraStyle.x < 2.5) {
+                cameraMask = roundedMask(uv, u.cameraRect, min(u.cameraRect.z, u.cameraRect.w) * 0.32);
+            } else if (u.cameraStyle.x < 3.5) {
+                cameraMask = roundedMask(uv, u.cameraRect, min(u.cameraRect.z, u.cameraRect.w) * u.cameraStyle.y);
+            } else {
+                cameraMask = inside(uv, u.cameraRect) ? 1.0 : 0.0;
+            }
             float2 cameraUV = (uv - u.cameraRect.xy) / u.cameraRect.zw;
+            if (u.cameraStyle.w > 0.5) cameraUV.x = 1.0 - cameraUV.x;
             float sourceAspect = float(camera.get_width()) / max(float(camera.get_height()), 1.0);
             float destinationAspect = (u.cameraRect.z * u.output.x) / max(u.cameraRect.w * u.output.y, 1.0);
             if (sourceAspect > destinationAspect) {
@@ -628,6 +822,11 @@ final class MetalProjectRenderer: @unchecked Sendable {
             }
             float4 cameraColor = camera.sample(s, cameraUV);
             color = mix(color, cameraColor, cameraMask * u.cameraFocus.w);
+            if (u.cameraStyle.z > 0.0) {
+                float inner = roundedMask(uv, float4(u.cameraRect.xy + u.cameraStyle.z, u.cameraRect.zw - u.cameraStyle.z * 2.0), max(0.0, min(u.cameraRect.z, u.cameraRect.w) * u.cameraStyle.y - u.cameraStyle.z));
+                float border = max(0.0, cameraMask - inner);
+                color = mix(color, u.cameraBorderColor, border);
+            }
         }
 
         if (u.chrome.x > 0.5 && windowMask > 0.5 && inside(uv, float4(u.windowRect.xy, u.windowRect.z, u.screenRect.y - u.windowRect.y))) {
@@ -683,6 +882,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         }
         if (u.text.x > 0.001 && inside(uv, u.textRect)) {
             float2 textUV = (uv - u.textRect.xy) / u.textRect.zw;
+            textUV.y = 1.0 - textUV.y;
             float4 textColor = textTexture.sample(s, textUV);
             color = mix(color, textColor, textColor.a * u.text.x);
         }

@@ -49,10 +49,28 @@ enum CanvasBackgroundPreset: String, Codable, CaseIterable, Hashable, Sendable {
     }
 }
 
+enum CameraFrameShape: String, Codable, CaseIterable, Hashable, Sendable {
+    case circle, squircle, roundedRectangle, rectangle
+
+    var displayName: String {
+        switch self {
+        case .circle: "Circle"
+        case .squircle: "Squircle"
+        case .roundedRectangle: "Rounded"
+        case .rectangle: "Rectangle"
+        }
+    }
+}
+
 struct CanvasAppearance: Codable, Hashable, Sendable {
     var backgroundPreset: CanvasBackgroundPreset = .studio
     var customColorHex = "#6C5CE7"
+    var customGradientStartHex = "#6C5CE7"
+    var customGradientEndHex = "#B96CFF"
+    var gradientAngle = 45.0
+    var vignette = 0.0
     var padding = 72.0
+    var inset = 0.0
     var cornerRadius = 18.0
     var shadowStrength = 18.0
     var showsWindowFrame = true
@@ -60,6 +78,12 @@ struct CanvasAppearance: Codable, Hashable, Sendable {
     var cameraPositionY = 0.78
     var cameraWidth = 0.24
     var cameraHeight = 0.24
+    var cameraShape: CameraFrameShape = .circle
+    var cameraCornerRadius = 0.18
+    var cameraBorderWidth = 0.0
+    var cameraBorderHex = "#FFFFFF"
+    var cameraShadow = 0.0
+    var cameraMirrored = true
 
     static let `default` = CanvasAppearance()
 }
@@ -68,7 +92,9 @@ extension CanvasAppearance {
     private enum CodingKeys: String, CodingKey {
         case backgroundPreset
         case customColorHex
+        case customGradientStartHex, customGradientEndHex, gradientAngle, vignette
         case padding
+        case inset
         case cornerRadius
         case shadowStrength
         case showsWindowFrame
@@ -76,6 +102,7 @@ extension CanvasAppearance {
         case cameraPositionY
         case cameraWidth
         case cameraHeight
+        case cameraShape, cameraCornerRadius, cameraBorderWidth, cameraBorderHex, cameraShadow, cameraMirrored
         // Kept as a decoding/encoding bridge for projects created by earlier builds.
         case cameraSize
     }
@@ -84,7 +111,12 @@ extension CanvasAppearance {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         backgroundPreset = try values.decodeIfPresent(CanvasBackgroundPreset.self, forKey: .backgroundPreset) ?? .studio
         customColorHex = try values.decodeIfPresent(String.self, forKey: .customColorHex) ?? "#6C5CE7"
+        customGradientStartHex = try values.decodeIfPresent(String.self, forKey: .customGradientStartHex) ?? customColorHex
+        customGradientEndHex = try values.decodeIfPresent(String.self, forKey: .customGradientEndHex) ?? customColorHex
+        gradientAngle = try values.decodeIfPresent(Double.self, forKey: .gradientAngle) ?? 45
+        vignette = try values.decodeIfPresent(Double.self, forKey: .vignette) ?? 0
         padding = try values.decodeIfPresent(Double.self, forKey: .padding) ?? 72
+        inset = try values.decodeIfPresent(Double.self, forKey: .inset) ?? 0
         cornerRadius = try values.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 18
         shadowStrength = try values.decodeIfPresent(Double.self, forKey: .shadowStrength) ?? 18
         showsWindowFrame = try values.decodeIfPresent(Bool.self, forKey: .showsWindowFrame) ?? true
@@ -93,13 +125,24 @@ extension CanvasAppearance {
         let legacyCameraSize = try values.decodeIfPresent(Double.self, forKey: .cameraSize)
         cameraWidth = try values.decodeIfPresent(Double.self, forKey: .cameraWidth) ?? legacyCameraSize ?? 0.24
         cameraHeight = try values.decodeIfPresent(Double.self, forKey: .cameraHeight) ?? legacyCameraSize ?? 0.24
+        cameraShape = try values.decodeIfPresent(CameraFrameShape.self, forKey: .cameraShape) ?? .circle
+        cameraCornerRadius = try values.decodeIfPresent(Double.self, forKey: .cameraCornerRadius) ?? 0.18
+        cameraBorderWidth = try values.decodeIfPresent(Double.self, forKey: .cameraBorderWidth) ?? 0
+        cameraBorderHex = try values.decodeIfPresent(String.self, forKey: .cameraBorderHex) ?? "#FFFFFF"
+        cameraShadow = try values.decodeIfPresent(Double.self, forKey: .cameraShadow) ?? 0
+        cameraMirrored = try values.decodeIfPresent(Bool.self, forKey: .cameraMirrored) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(backgroundPreset, forKey: .backgroundPreset)
         try values.encode(customColorHex, forKey: .customColorHex)
+        try values.encode(customGradientStartHex, forKey: .customGradientStartHex)
+        try values.encode(customGradientEndHex, forKey: .customGradientEndHex)
+        try values.encode(gradientAngle, forKey: .gradientAngle)
+        try values.encode(vignette, forKey: .vignette)
         try values.encode(padding, forKey: .padding)
+        try values.encode(inset, forKey: .inset)
         try values.encode(cornerRadius, forKey: .cornerRadius)
         try values.encode(shadowStrength, forKey: .shadowStrength)
         try values.encode(showsWindowFrame, forKey: .showsWindowFrame)
@@ -107,6 +150,12 @@ extension CanvasAppearance {
         try values.encode(cameraPositionY, forKey: .cameraPositionY)
         try values.encode(cameraWidth, forKey: .cameraWidth)
         try values.encode(cameraHeight, forKey: .cameraHeight)
+        try values.encode(cameraShape, forKey: .cameraShape)
+        try values.encode(cameraCornerRadius, forKey: .cameraCornerRadius)
+        try values.encode(cameraBorderWidth, forKey: .cameraBorderWidth)
+        try values.encode(cameraBorderHex, forKey: .cameraBorderHex)
+        try values.encode(cameraShadow, forKey: .cameraShadow)
+        try values.encode(cameraMirrored, forKey: .cameraMirrored)
         try values.encode(cameraWidth, forKey: .cameraSize)
     }
 }
@@ -259,6 +308,96 @@ struct TextOverlay: Codable, Identifiable, Hashable, Sendable {
     var backgroundOpacity: Double = 0
     var opacity: Double = 1
     var trackID: UUID? = nil
+    var fontName: String? = nil
+    var letterSpacing: Double? = nil
+    var lineHeight: Double? = nil
+    var strokeHex: String? = nil
+    var strokeWidth: Double? = nil
+    var shadowOpacity: Double? = nil
+    var entrance: VisualTransition? = nil
+    var exit: VisualTransition? = nil
+}
+
+enum VisualTransition: String, Codable, CaseIterable, Hashable, Sendable {
+    case none, fade, slideUp, slideLeft, scale, typewriter
+}
+
+enum VisualElementKind: String, Codable, Hashable, Sendable {
+    case video, webcam, text, branding
+}
+
+enum AnimatableVisualProperty: String, Codable, Hashable, Sendable {
+    case positionX, positionY, width, height, scale, rotation, opacity, blur
+}
+
+struct VisualPropertyKeyframe: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var elementID: UUID
+    var elementKind: VisualElementKind
+    var property: AnimatableVisualProperty
+    var time: Double
+    var value: Double
+    var easing: CameraEasing = .easeInOut
+}
+
+struct BrandKit: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var name: String
+    var primaryHex = "#6C5CE7"
+    var secondaryHex = "#B96CFF"
+    var textHex = "#FFFFFF"
+    var fontName = "SF Pro Display"
+    var logoAssetPath: String? = nil
+    var watermarkOpacity = 0.8
+}
+
+enum PresenterLayout: String, Codable, CaseIterable, Hashable, Sendable {
+    case screenOnly, cameraOnly, pictureInPicture, sideBySide, presenter
+}
+
+enum SplitOrientation: String, Codable, CaseIterable, Hashable, Sendable {
+    case horizontal, vertical
+}
+
+struct SideBySideConfiguration: Codable, Hashable, Sendable {
+    var orientation: SplitOrientation = .horizontal
+    /// Fraction of the available content area assigned to the screen recording.
+    var screenFraction = 0.66
+    /// Gap as a fraction of the split axis.
+    var gap = 0.02
+    var screenFirst = true
+
+    static let `default` = SideBySideConfiguration()
+
+    var normalized: SideBySideConfiguration {
+        var value = self
+        value.screenFraction = min(max(screenFraction, 0.2), 0.8)
+        value.gap = min(max(gap, 0), 0.12)
+        return value
+    }
+}
+
+struct LayoutSegment: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var startTime: Double
+    var endTime: Double
+    var layout: PresenterLayout
+    var transitionDuration = 0.35
+    /// Optional keeps projects created before configurable split layouts decodable.
+    var sideBySide: SideBySideConfiguration? = nil
+}
+
+struct ProjectAudioAsset: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var name: String
+    var assetPath: String
+    var startTime: Double
+    var sourceStart = 0.0
+    var duration: Double
+    var volume = 0.35
+    var fadeIn = 0.5
+    var fadeOut = 0.8
+    var ducksUnderVoice = true
 }
 
 struct BrandingOverlay: Codable, Identifiable, Hashable, Sendable {
@@ -390,6 +529,10 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var textOverlays: [TextOverlay]? = nil
     var timelineTracks: [TimelineTrack]? = nil
     var videoAssets: [ProjectVideoAsset]? = nil
+    var audioAssets: [ProjectAudioAsset]? = nil
+    var visualKeyframes: [VisualPropertyKeyframe]? = nil
+    var layoutSegments: [LayoutSegment]? = nil
+    var brandKit: BrandKit? = nil
 }
 
 struct CapturaPreset: Codable, Identifiable, Hashable, Sendable {
@@ -402,6 +545,7 @@ struct CapturaPreset: Codable, Identifiable, Hashable, Sendable {
     var audio: ProjectAudioSettings
     var cursor: CursorAppearance
     var export: ExportSettings?
+    var brandKit: BrandKit? = nil
 }
 
 struct RecordingRecoveryManifest: Codable, Hashable, Sendable {

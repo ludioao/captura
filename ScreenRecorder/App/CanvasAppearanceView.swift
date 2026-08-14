@@ -205,12 +205,16 @@ struct CanvasMockupPreview: View {
         let height = max(56, size.height * appearance.cameraHeight)
         let normalizedHalfWidth = width / max(size.width, 1) / 2
         let normalizedHalfHeight = height / max(size.height, 1) / 2
+        let shape = cameraClipShape(width: width, height: height)
         return NativePlayerView(player: player, videoGravity: .resizeAspectFill)
+            .scaleEffect(x: appearance.cameraMirrored ? -1 : 1, y: 1)
             .frame(width: width, height: height)
-            .clipShape(RoundedRectangle(cornerRadius: max(8, appearance.cornerRadius * 0.65)))
+            .clipShape(shape)
             .overlay(
-                RoundedRectangle(cornerRadius: max(8, appearance.cornerRadius * 0.65))
-                    .stroke(.white.opacity(0.78), lineWidth: 1.5)
+                shape.stroke(
+                    Color(capturaHex: appearance.cameraBorderHex),
+                    lineWidth: appearance.cameraBorderWidth
+                )
             )
             .overlay(alignment: .bottomTrailing) {
                 if allowsCameraDragging {
@@ -219,7 +223,7 @@ struct CanvasMockupPreview: View {
                         .highPriorityGesture(cameraResizeGesture(in: size))
                 }
             }
-            .shadow(color: .black.opacity(0.3), radius: 10, y: 5)
+            .shadow(color: .black.opacity(appearance.cameraShadow), radius: 14 * appearance.cameraShadow, y: 6 * appearance.cameraShadow)
             .position(
                 x: size.width * appearance.cameraPositionX,
                 y: size.height * appearance.cameraPositionY
@@ -244,6 +248,15 @@ struct CanvasMockupPreview: View {
                     .onEnded { _ in cameraDragOrigin = nil }
             )
             .help(allowsCameraDragging ? "Drag to reposition the camera" : "Camera overlay")
+    }
+
+    private func cameraClipShape(width: Double, height: Double) -> AnyShape {
+        switch appearance.cameraShape {
+        case .circle: AnyShape(Ellipse())
+        case .squircle: AnyShape(RoundedRectangle(cornerRadius: min(width, height) * 0.32, style: .continuous))
+        case .roundedRectangle: AnyShape(RoundedRectangle(cornerRadius: min(width, height) * appearance.cameraCornerRadius, style: .continuous))
+        case .rectangle: AnyShape(Rectangle())
+        }
     }
 
     private func cameraResizeGesture(in size: CGSize) -> some Gesture {
@@ -332,8 +345,10 @@ struct CanvasAppearanceInspector: View {
     @Binding var appearance: CanvasAppearance
     @Binding var audio: ProjectAudioSettings
     @Binding var cursor: CursorAppearance
+    @Binding var brandKit: BrandKit?
     let hasCamera: Bool
     @State private var savedPresets = CapturaPresetStore.load()
+    @State private var savedBrandKits = BrandKitStore.load()
     @State private var presetError: String?
 
     var body: some View {
@@ -362,7 +377,8 @@ struct CanvasAppearanceInspector: View {
                             appearance: appearance,
                             audio: audio,
                             cursor: cursor,
-                            export: lastExportSettings
+                            export: lastExportSettings,
+                            brandKit: brandKit
                         ))
                         CapturaPresetStore.save(savedPresets)
                     }
@@ -375,6 +391,38 @@ struct CanvasAppearanceInspector: View {
                         Image(systemName: "square.and.arrow.up.on.square")
                     }
                     .help("Import or export .capturapreset files")
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Brand Kit").font(.headline)
+                    Picker("Brand", selection: Binding(
+                        get: { brandKit?.id },
+                        set: { id in
+                            brandKit = savedBrandKits.first { $0.id == id }
+                            applyBrandKit()
+                        }
+                    )) {
+                        Text("None").tag(UUID?.none)
+                        ForEach(savedBrandKits) { kit in Text(kit.name).tag(Optional(kit.id)) }
+                    }
+                    HStack {
+                        Button("Save Current Brand") {
+                            let kit = BrandKit(
+                                name: "Brand \(savedBrandKits.count + 1)",
+                                primaryHex: appearance.customGradientStartHex,
+                                secondaryHex: appearance.customGradientEndHex
+                            )
+                            savedBrandKits.append(kit)
+                            BrandKitStore.save(savedBrandKits)
+                            brandKit = kit
+                        }
+                        if brandKit != nil {
+                            Button("Apply", action: applyBrandKit)
+                        }
+                    }
+                    Text("Brand colors style the canvas; typography and text color are reused by title layers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -403,13 +451,17 @@ struct CanvasAppearanceInspector: View {
                         }
                     }
                     if appearance.backgroundPreset == .custom {
-                        ColorPicker("Custom color", selection: customColorBinding)
+                        ColorPicker("Start color", selection: customGradientStartBinding)
+                        ColorPicker("End color", selection: customGradientEndBinding)
+                        slider("Direction", value: $appearance.gradientAngle, range: 0...360, suffix: "°")
                     }
                 }
 
-                slider("Padding", value: $appearance.padding, range: 16...144, suffix: " px")
+                slider("Padding", value: $appearance.padding, range: 0...180, suffix: " px")
+                slider("Inset", value: $appearance.inset, range: 0...32, suffix: " px")
                 slider("Corner radius", value: $appearance.cornerRadius, range: 0...36, suffix: " px")
                 slider("Shadow", value: $appearance.shadowStrength, range: 0...32, suffix: "")
+                slider("Vignette", value: $appearance.vignette, range: 0...1, suffix: "")
 
                 Toggle(isOn: $appearance.showsWindowFrame) {
                     Label("Window frame", systemImage: "macwindow")
@@ -451,6 +503,20 @@ struct CanvasAppearanceInspector: View {
 
             cameraDimensionSlider("Width", value: cameraDimensionBinding(\.cameraWidth))
             cameraDimensionSlider("Height", value: cameraDimensionBinding(\.cameraHeight))
+            Picker("Shape", selection: $appearance.cameraShape) {
+                ForEach(CameraFrameShape.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            slider("Camera corners", value: $appearance.cameraCornerRadius, range: 0...0.5, suffix: "")
+            slider("Camera border", value: $appearance.cameraBorderWidth, range: 0...12, suffix: " px")
+            ColorPicker("Border color", selection: cameraBorderBinding)
+            slider("Camera shadow", value: $appearance.cameraShadow, range: 0...1, suffix: "")
+            Toggle("Mirror camera", isOn: $appearance.cameraMirrored)
+            Button("Remove border and shadow", systemImage: "circle.slash") {
+                appearance.cameraBorderWidth = 0
+                appearance.cameraShadow = 0
+            }
+            .disabled(appearance.cameraBorderWidth == 0 && appearance.cameraShadow == 0)
 
             Label("Drag the camera to move it, or use its corner handle to resize it.", systemImage: "hand.draw")
                 .font(.caption)
@@ -528,14 +594,37 @@ struct CanvasAppearanceInspector: View {
         return value
     }
 
-    private var customColorBinding: Binding<Color> {
+    private var customGradientStartBinding: Binding<Color> {
         Binding(
-            get: { Color(capturaHex: appearance.customColorHex) },
+            get: { Color(capturaHex: appearance.customGradientStartHex) },
             set: {
-                appearance.customColorHex = NSColor($0).capturaHex
+                appearance.customGradientStartHex = NSColor($0).capturaHex
+                appearance.customColorHex = appearance.customGradientStartHex
                 appearance.backgroundPreset = .custom
             }
         )
+    }
+
+    private var customGradientEndBinding: Binding<Color> {
+        Binding(
+            get: { Color(capturaHex: appearance.customGradientEndHex) },
+            set: { appearance.customGradientEndHex = NSColor($0).capturaHex; appearance.backgroundPreset = .custom }
+        )
+    }
+
+    private var cameraBorderBinding: Binding<Color> {
+        Binding(
+            get: { Color(capturaHex: appearance.cameraBorderHex) },
+            set: { appearance.cameraBorderHex = NSColor($0).capturaHex }
+        )
+    }
+
+    private func applyBrandKit() {
+        guard let brandKit else { return }
+        appearance.backgroundPreset = .custom
+        appearance.customGradientStartHex = brandKit.primaryHex
+        appearance.customGradientEndHex = brandKit.secondaryHex
+        appearance.customColorHex = brandKit.primaryHex
     }
 
     private func importPreset() {
@@ -575,6 +664,8 @@ struct CanvasAppearanceInspector: View {
         appearance = preset.appearance
         audio = preset.audio
         cursor = preset.cursor
+        brandKit = preset.brandKit
+        applyBrandKit()
         if let export = preset.export, let data = try? JSONEncoder().encode(export) {
             UserDefaults.standard.set(data, forKey: "captura.lastExportSettings")
         }
@@ -582,7 +673,8 @@ struct CanvasAppearanceInspector: View {
 }
 
 func canvasBackgroundStyle(_ appearance: CanvasAppearance) -> AnyShapeStyle {
-    switch appearance.backgroundPreset {
+    let customPoints = gradientUnitPoints(angle: appearance.gradientAngle)
+    return switch appearance.backgroundPreset {
     case .studio:
         AnyShapeStyle(LinearGradient(colors: [Color(capturaHex: "#F2D6C8"), Color(capturaHex: "#C6A7E8")], startPoint: .topLeading, endPoint: .bottomTrailing))
     case .midnight:
@@ -594,8 +686,22 @@ func canvasBackgroundStyle(_ appearance: CanvasAppearance) -> AnyShapeStyle {
     case .graphite:
         AnyShapeStyle(LinearGradient(colors: [Color(capturaHex: "#24262B"), Color(capturaHex: "#555A65")], startPoint: .top, endPoint: .bottom))
     case .custom:
-        AnyShapeStyle(Color(capturaHex: appearance.customColorHex))
+        AnyShapeStyle(LinearGradient(
+            colors: [Color(capturaHex: appearance.customGradientStartHex), Color(capturaHex: appearance.customGradientEndHex)],
+            startPoint: customPoints.start,
+            endPoint: customPoints.end
+        ))
     }
+}
+
+func gradientUnitPoints(angle: Double) -> (start: UnitPoint, end: UnitPoint) {
+    let radians = angle * .pi / 180
+    let dx = cos(radians) * 0.5
+    let dy = sin(radians) * 0.5
+    return (
+        UnitPoint(x: 0.5 - dx, y: 0.5 - dy),
+        UnitPoint(x: 0.5 + dx, y: 0.5 + dy)
+    )
 }
 
 private extension Color {

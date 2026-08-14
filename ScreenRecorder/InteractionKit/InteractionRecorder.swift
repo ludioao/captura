@@ -163,7 +163,17 @@ final class InteractionRecorder: NSObject, @unchecked Sendable {
             )
             lock.withLock { recordedEvents.append(item) }
         case .keyDown:
-            let item = InteractionEvent(type: .keyActivity, timestamp: timestamp, keyCode: Int(event.getIntegerValueField(.keyboardEventKeycode)), isTextInput: true)
+            let normalized = lock.withLock {
+                latestMousePosition.map { CoordinateNormalizer.normalize(point: $0, in: displayFrame) }
+            }
+            let item = InteractionEvent(
+                type: .keyActivity,
+                timestamp: timestamp,
+                normalizedX: normalized.map { Double($0.x) },
+                normalizedY: normalized.map { Double($0.y) },
+                keyCode: Int(event.getIntegerValueField(.keyboardEventKeycode)),
+                isTextInput: true
+            )
             lock.withLock { recordedEvents.append(item) }
         default:
             break

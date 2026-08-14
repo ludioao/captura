@@ -52,29 +52,35 @@ private struct HomeView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        HStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    brandHeader
-                    if model.recordingState == .recording || model.recordingState == .paused || model.recordingState == .stopping {
-                        RecordingController()
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        sourcePreviewCard
-                        configurationForm
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(40)
-            }
-            .frame(minWidth: 540, maxWidth: .infinity, alignment: .topLeading)
-            .background(Color(nsColor: .windowBackgroundColor))
-
+        VStack(spacing: 0) {
+            brandHeader
             Divider()
 
-            RecentProjectsView()
-                .frame(width: 330)
+            if model.recordingState == .recording || model.recordingState == .paused || model.recordingState == .stopping {
+                RecordingController()
+                    .frame(maxWidth: 520)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(32)
+            } else {
+                HSplitView {
+                    sourcePreviewCard
+                        .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
+
+                    ScrollView {
+                        configurationForm
+                            .padding(24)
+                    }
+                    .frame(minWidth: 330, idealWidth: 360, maxWidth: 390)
+                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
+                }
+
+                Divider()
+
+                RecentProjectsView()
+                    .frame(height: 190)
+            }
         }
+        .background(Color(nsColor: .windowBackgroundColor))
         .onChange(of: model.sourceKind) { _, _ in model.scheduleSourcePreviewRefresh() }
         .onChange(of: model.selectedDisplayID) { _, _ in model.scheduleSourcePreviewRefresh() }
         .onChange(of: model.selectedWindowID) { _, _ in model.scheduleSourcePreviewRefresh() }
@@ -82,32 +88,48 @@ private struct HomeView: View {
     }
 
     private var brandHeader: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             Image(nsImage: NSApp.applicationIconImage)
                 .resizable()
                 .scaledToFit()
-                .frame(width: 52, height: 52)
-                .shadow(color: .black.opacity(0.14), radius: 8, y: 4)
-            VStack(alignment: .leading, spacing: 2) {
+                .frame(width: 34, height: 34)
+            VStack(alignment: .leading, spacing: 0) {
                 Text("captura")
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                Text("Record your screen. Shape the story.")
-                    .font(.subheadline)
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                Text("New recording")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Label("Ready", systemImage: "checkmark.circle.fill")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.green)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(.green.opacity(0.1), in: Capsule())
+
+            Button { Task { await model.chooseMediaToImport() } } label: {
+                Label("Import Video", systemImage: "square.and.arrow.down")
+            }
+            .buttonStyle(.borderless)
+
+            Button { Task { await model.chooseProject() } } label: {
+                Label("Open Project", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
         }
+        .controlSize(.regular)
+        .padding(.horizontal, 20)
+        .frame(height: 58)
+        .background(.bar)
     }
 
     private var configurationForm: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Set up recording")
+                    .font(.title2.weight(.semibold))
+                Text("Choose what captura should record and how it should sound.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
                 sectionTitle("Source", icon: "rectangle.dashed.badge.record")
                 Picker("Capture", selection: $model.sourceKind) {
                     ForEach(CaptureSourceKind.allCases, id: \.self) {
@@ -133,7 +155,7 @@ private struct HomeView: View {
                         .buttonStyle(.link)
                     }
                 } else if model.sourceKind == .display || model.sourceKind == .area {
-                    VStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 10) {
                         Picker("Display", selection: $model.selectedDisplayID) {
                             ForEach(model.displays) { display in
                                 Text("\(display.name) — \(display.width)×\(display.height)").tag(Optional(display.id))
@@ -169,51 +191,63 @@ private struct HomeView: View {
                 }
             }
 
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 10) {
-                    sectionTitle("Quality", icon: "sparkles.rectangle.stack")
-                    Picker("Resolution", selection: $model.resolution) {
-                        ForEach(RecordingResolution.allCases, id: \.self) { Text($0.displayName).tag($0) }
-                    }
-                    Picker("Frame rate", selection: $model.frameRate) {
-                        Text("30 FPS").tag(30)
-                        Text("60 FPS").tag(60)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                sectionTitle("Audio & camera", icon: "waveform.and.mic")
+                inputToggle(
+                    title: model.sourceKind == .device ? "Device audio" : "System audio",
+                    detail: model.sourceKind == .device ? "Sound from the connected device" : "Apps, calls and browser audio",
+                    icon: "speaker.wave.2.fill",
+                    isOn: $model.captureSystemAudio
+                )
+                inputToggle(
+                    title: "Microphone",
+                    detail: "Add your voice as a separate input",
+                    icon: "mic.fill",
+                    isOn: $model.captureMicrophone
+                )
+                if model.captureMicrophone {
+                    Picker("Microphone", selection: $model.selectedMicrophoneID) {
+                        ForEach(model.microphones) { microphone in
+                            Text(microphone.name).tag(Optional(microphone.id))
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .panelSurface()
-
-                VStack(alignment: .leading, spacing: 12) {
-                    sectionTitle("Inputs", icon: "waveform.and.mic")
-                    Toggle(isOn: $model.captureSystemAudio) {
-                        Label(
-                            model.sourceKind == .device ? "Device audio" : "System audio",
-                            systemImage: "speaker.wave.2.fill"
-                        )
-                    }
-                    Toggle(isOn: $model.captureMicrophone) {
-                        Label("Microphone", systemImage: "mic.fill")
-                    }
-                    Toggle(isOn: $model.captureWebcam) {
-                        Label("Webcam", systemImage: "video.fill")
-                    }
-                }
-                .toggleStyle(.switch)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .panelSurface()
-            }
-
-            if model.captureMicrophone {
-                Picker("Microphone", selection: $model.selectedMicrophoneID) {
-                    ForEach(model.microphones) { microphone in
-                        Text(microphone.name).tag(Optional(microphone.id))
+                inputToggle(
+                    title: "Webcam",
+                    detail: "Record your camera alongside the screen",
+                    icon: "video.fill",
+                    isOn: $model.captureWebcam
+                )
+                if model.captureWebcam {
+                    Picker("Camera", selection: $model.selectedCameraID) {
+                        ForEach(model.cameras) { camera in
+                            Text(camera.name).tag(Optional(camera.id))
+                        }
                     }
                 }
             }
-            if model.captureWebcam {
-                Picker("Camera", selection: $model.selectedCameraID) {
-                    ForEach(model.cameras) { camera in
-                        Text(camera.name).tag(Optional(camera.id))
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                sectionTitle("Quality", icon: "sparkles.rectangle.stack")
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    GridRow {
+                        Text("Resolution").foregroundStyle(.secondary)
+                        Picker("Resolution", selection: $model.resolution) {
+                            ForEach(RecordingResolution.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                        }
+                        .labelsHidden()
+                    }
+                    GridRow {
+                        Text("Frame rate").foregroundStyle(.secondary)
+                        Picker("Frame rate", selection: $model.frameRate) {
+                            Text("30 FPS").tag(30)
+                            Text("60 FPS").tag(60)
+                        }
+                        .labelsHidden()
                     }
                 }
             }
@@ -222,7 +256,7 @@ private struct HomeView: View {
                 Circle().fill(permissionColor).frame(width: 7, height: 7)
                 Text(permissionStatusText)
                     .foregroundStyle(.secondary)
-                Spacer()
+                Spacer(minLength: 8)
                 if model.sourceKind != .device && model.permissionSnapshot.screenRecording != .granted {
                     Button("Grant Access") { Task { await model.requestScreenPermission() } }
                         .buttonStyle(.link)
@@ -236,87 +270,103 @@ private struct HomeView: View {
             }
             .font(.caption)
 
-            HStack {
-                Button {
-                    Task { await model.startRecording() }
-                } label: {
-                    Label(model.recordingState == .preparing ? "Preparing…" : "Start Recording", systemImage: "record.circle.fill")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
+            Button {
+                Task { await model.startRecording() }
+            } label: {
+                HStack {
+                    Image(systemName: "record.circle.fill")
+                    Text(model.recordingState == .preparing ? "Preparing…" : "Start Recording")
+                    Spacer()
+                    Text("⌘↩")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.white.opacity(0.72))
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .tint(.red)
-                .disabled(
-                    (model.sourceKind != .device && model.sourceStatusMessage != nil) ||
-                    (model.sourceKind == .device
-                        ? model.selectedExternalDeviceID == nil
-                        : (model.sourceKind == .window ? model.selectedWindowID == nil : model.selectedDisplayID == nil)) ||
-                    model.recordingState == .preparing
-                )
+                .font(.headline)
+                .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .tint(.red)
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(recordButtonDisabled)
         }
-        .frame(maxWidth: 560)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var sourcePreviewCard: some View {
         VStack(spacing: 0) {
-            ZStack {
-                Color.black
-                if let preview = model.sourcePreview {
-                    Image(nsImage: preview)
-                        .resizable()
-                        .scaledToFit()
-                } else if model.isRefreshingSourcePreview {
-                    ProgressView()
-                        .controlSize(.large)
-                        .tint(.white)
-                } else {
-                    VStack(spacing: 10) {
-                        Image(systemName: "rectangle.dashed")
-                            .font(.system(size: 30, weight: .light))
-                        Text(model.sourcePreviewMessage ?? "Choose a source to preview")
-                            .font(.callout)
-                    }
-                    .foregroundStyle(.white.opacity(0.7))
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Live preview")
+                        .font(.headline)
+                    Text(selectedSourceName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                if model.sourceKind == .area, model.sourcePreview != nil {
-                    AreaSelectionOverlay(
-                        rect: $model.captureRegionNormalized,
-                        aspectRatio: model.areaAspectLock.ratio
-                    )
+                Spacer()
+                if model.isRefreshingSourcePreview { ProgressView().controlSize(.small) }
+                Button { Task { await model.refreshSourcePreview() } } label: {
+                    Image(systemName: "arrow.clockwise")
                 }
+                .buttonStyle(.bordered)
+                .help("Refresh source preview")
             }
-            .aspectRatio(sourcePreviewAspectRatio, contentMode: .fit)
+            .padding(.horizontal, 24)
+            .frame(height: 64)
+
+            ZStack {
+                Color(nsColor: .black)
+                VStack {
+                    ZStack {
+                        Color.black
+                        if let preview = model.sourcePreview {
+                            Image(nsImage: preview)
+                                .resizable()
+                                .scaledToFit()
+                        } else if model.isRefreshingSourcePreview {
+                            ProgressView()
+                                .controlSize(.large)
+                                .tint(.white)
+                        } else {
+                            VStack(spacing: 12) {
+                                Image(systemName: "rectangle.dashed")
+                                    .font(.system(size: 34, weight: .light))
+                                Text(model.sourcePreviewMessage ?? "Choose a source to preview")
+                                    .font(.callout)
+                            }
+                            .foregroundStyle(.white.opacity(0.7))
+                        }
+                        if model.sourceKind == .area, model.sourcePreview != nil {
+                            AreaSelectionOverlay(
+                                rect: $model.captureRegionNormalized,
+                                aspectRatio: model.areaAspectLock.ratio
+                            )
+                        }
+                    }
+                    .aspectRatio(sourcePreviewAspectRatio, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .shadow(color: .black.opacity(0.55), radius: 24, y: 14)
+                }
+                .padding(32)
+            }
+            .frame(maxHeight: .infinity)
 
             HStack(spacing: 8) {
                 Image(systemName: sourceIcon(model.sourceKind))
-                Text(selectedSourceName)
-                    .lineLimit(1)
+                Text(model.sourceKind.rawValue)
                 Spacer()
-                if model.isRefreshingSourcePreview {
-                    ProgressView().controlSize(.small)
-                }
-                Button {
-                    Task { await model.refreshSourcePreview() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh source preview")
+                Label(model.resolution.displayName, systemImage: "aspectratio")
+                Text("·")
+                Text("\(model.frameRate) FPS")
             }
             .font(.caption.weight(.medium))
-            .padding(.horizontal, 12)
-            .frame(height: 38)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 24)
+            .frame(height: 44)
             .background(.bar)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .background {
-            RoundedRectangle(cornerRadius: 14)
-                .fill(Color(nsColor: .controlBackgroundColor))
-                .shadow(color: .black.opacity(0.12), radius: 12, y: 6)
-        }
-        .frame(maxWidth: 560)
         .task(id: previewSelectionKey) {
             await model.refreshSourcePreview()
             while !Task.isCancelled {
@@ -358,6 +408,35 @@ private struct HomeView: View {
         Label(title, systemImage: icon)
             .font(.headline)
             .foregroundStyle(.primary)
+    }
+
+    private func inputToggle(
+        title: String,
+        detail: String,
+        icon: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .frame(width: 22)
+                .foregroundStyle(isOn.wrappedValue ? Color.accentColor : Color.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout.weight(.medium))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+    }
+
+    private var recordButtonDisabled: Bool {
+        (model.sourceKind != .device && model.sourceStatusMessage != nil) ||
+        (model.sourceKind == .device
+            ? model.selectedExternalDeviceID == nil
+            : (model.sourceKind == .window ? model.selectedWindowID == nil : model.selectedDisplayID == nil)) ||
+        model.recordingState == .preparing
     }
 
     private var permissionColor: Color {
@@ -434,34 +513,37 @@ private struct RecentProjectsView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Recent Projects")
-                    .font(.title3.weight(.semibold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Recent projects")
+                        .font(.headline)
+                    Text(model.recentProjects.isEmpty ? "Your finished recordings will appear here" : "Continue where you left off")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button { Task { await model.refreshRecentProjects() } } label: {
                     Image(systemName: "arrow.clockwise")
                 }
+                .buttonStyle(.borderless)
                 .help("Refresh projects")
             }
 
             if model.recentProjects.isEmpty {
-                VStack(spacing: 12) {
+                HStack(spacing: 12) {
                     Image(systemName: "film.stack")
-                        .font(.system(size: 34, weight: .light))
+                        .font(.title2)
                         .foregroundStyle(.secondary)
-                    Text("Your recordings live here")
-                        .font(.headline)
-                    Text("Finish a recording or open an existing project to start editing.")
+                    Text("Record something new, open a project, or import an existing video.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
+                    Spacer()
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(24)
+                .padding(.vertical, 16)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 12) {
                         ForEach(model.recentProjects) { project in
                             Button {
                                 Task { await model.openProject(at: project.url) }
@@ -472,28 +554,12 @@ private struct RecentProjectsView: View {
                         }
                     }
                 }
+                .scrollIndicators(.hidden)
             }
-
-            Button {
-                Task { await model.chooseProject() }
-            } label: {
-                Label("Open Project…", systemImage: "folder")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .disabled(model.recordingState == .preparing)
-
-            Button {
-                Task { await model.chooseMediaToImport() }
-            } label: {
-                Label("Import Video…", systemImage: "square.and.arrow.down")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .disabled(model.recordingState == .preparing)
         }
-        .padding(24)
-        .background(Color(nsColor: .underPageBackgroundColor))
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(.bar)
     }
 }
 
@@ -501,19 +567,33 @@ private struct RecentProjectRow: View {
     let project: RecentProject
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(.blue.opacity(0.13))
-                Image(systemName: project.hasWebcam ? "rectangle.inset.filled.and.person.filled" : "rectangle.on.rectangle")
-                    .font(.title2)
-                    .foregroundStyle(.blue)
+                Color.black
+                VStack(spacing: 0) {
+                    HStack(spacing: 3) {
+                        Circle().fill(.red.opacity(0.9))
+                        Circle().fill(.yellow.opacity(0.9))
+                        Circle().fill(.green.opacity(0.9))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 6)
+                    .frame(height: 13)
+                    Rectangle()
+                        .fill(Color.accentColor.opacity(0.22))
+                        .overlay {
+                            Image(systemName: project.hasWebcam ? "rectangle.inset.filled.and.person.filled" : "rectangle.on.rectangle")
+                                .font(.title3)
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                }
             }
-            .frame(width: 54, height: 44)
+            .frame(width: 88, height: 58)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(project.name)
-                    .font(.headline)
+                    .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(format(project.duration))
@@ -527,14 +607,15 @@ private struct RecentProjectRow: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            .frame(width: 150, alignment: .leading)
         }
-        .padding(10)
-        .contentShape(RoundedRectangle(cornerRadius: 12))
-        .background(.background.opacity(0.82), in: RoundedRectangle(cornerRadius: 12))
+        .padding(8)
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.45), lineWidth: 0.5)
+        }
     }
 
     private func format(_ seconds: Double) -> String {
@@ -547,20 +628,7 @@ struct RecordingController: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            if model.captureWebcam {
-                CameraPreviewView(session: model.webcamPreviewSession)
-                    .frame(width: 300, height: 169)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .overlay(alignment: .topLeading) {
-                        Label("LIVE", systemImage: "circle.fill")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(.red.opacity(0.88), in: Capsule())
-                            .padding(10)
-                    }
-            }
+            recordingPreview
             HStack(spacing: 12) {
                 Circle().fill(model.recordingState == .paused ? .orange : .red).frame(width: 9, height: 9)
                 Text(Duration.seconds(model.elapsed).formatted(.time(pattern: .hourMinuteSecond)))
@@ -584,12 +652,44 @@ struct RecordingController: View {
         .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
-}
 
-private extension View {
-    func panelSurface() -> some View {
-        padding(16)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
+    private var recordingPreview: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Color.black
+            if let preview = model.liveScreenPreview ?? model.sourcePreview {
+                Image(nsImage: preview)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+            }
+
+            if model.captureWebcam {
+                CameraPreviewView(session: model.webcamPreviewSession)
+                    .frame(width: 112, height: 70)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(.white.opacity(0.75), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.42), radius: 8, y: 4)
+                    .padding(10)
+            }
+        }
+        .frame(width: 360, height: 203)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(alignment: .topLeading) {
+            Label("LIVE", systemImage: "circle.fill")
+                .font(.caption2.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.red.opacity(0.9), in: Capsule())
+                .padding(10)
+        }
+        .accessibilityLabel("Live screen and webcam recording preview")
     }
 }
 

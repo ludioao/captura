@@ -200,6 +200,32 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(CoordinateNormalizer.normalize(point: CGPoint(x: 0, y: 900), in: frame), CGPoint(x: 0, y: 1))
     }
 
+    func testCursorDoesNotDriftAcrossIdleGap() throws {
+        let samples = [
+            CursorSample(time: 1, normalizedX: 0.2, normalizedY: 0.3, cursorType: .arrow),
+            CursorSample(time: 5, normalizedX: 0.8, normalizedY: 0.7, cursorType: .arrow)
+        ]
+
+        let idle = try XCTUnwrap(CursorInterpolator().sample(at: 3, from: samples))
+        let arrived = try XCTUnwrap(CursorInterpolator().sample(at: 5, from: samples))
+
+        XCTAssertEqual(idle.normalizedX, 0.2, accuracy: 0.001)
+        XCTAssertEqual(idle.normalizedY, 0.3, accuracy: 0.001)
+        XCTAssertEqual(arrived.normalizedX, 0.8, accuracy: 0.001)
+        XCTAssertEqual(arrived.normalizedY, 0.7, accuracy: 0.001)
+    }
+
+    func testCursorStillSmoothsConsecutiveMovementSamples() throws {
+        let samples = [
+            CursorSample(time: 1, normalizedX: 0.2, normalizedY: 0.3, cursorType: .arrow),
+            CursorSample(time: 1.1, normalizedX: 0.8, normalizedY: 0.7, cursorType: .arrow)
+        ]
+
+        let moving = try XCTUnwrap(CursorInterpolator().sample(at: 1.05, from: samples))
+        XCTAssertEqual(moving.normalizedX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(moving.normalizedY, 0.5, accuracy: 0.001)
+    }
+
     func testTimelineSplitPreservesSourceAndDuration() throws {
         let sourceID = UUID()
         let clip = TimelineClip(id: UUID(), sourceMediaID: sourceID, sourceStart: 10, sourceEnd: 30, timelineStart: 5)
@@ -210,6 +236,31 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(halves.1.sourceStart, 18)
         XCTAssertEqual(halves.1.sourceEnd, 30)
         XCTAssertEqual(halves.0.duration + halves.1.duration, clip.duration)
+    }
+
+    func testSplitMovesExistingTransitionToTrailingClip() throws {
+        let clip = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 0, sourceEnd: 10,
+            timelineStart: 0, transitionOut: ClipTransition(kind: .flash, duration: 0.6)
+        )
+        let halves = try XCTUnwrap(clip.split(at: 4))
+        XCTAssertNil(halves.0.transitionOut)
+        XCTAssertEqual(halves.1.transitionOut, ClipTransition(kind: .flash, duration: 0.6))
+    }
+
+    func testTimelineTransitionPeaksAtCutAndStopsOutsideWindow() throws {
+        let first = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 0, sourceEnd: 4,
+            timelineStart: 0, transitionOut: ClipTransition(kind: .fade, duration: 0.8)
+        )
+        let second = TimelineClip(
+            id: UUID(), sourceMediaID: UUID(), sourceStart: 4, sourceEnd: 8,
+            timelineStart: 4
+        )
+        let timeline = Timeline(clips: [first, second])
+        XCTAssertEqual(try XCTUnwrap(timeline.activeTransition(at: 4)).intensity, 1, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(timeline.activeTransition(at: 3.8)).intensity, 0.5, accuracy: 0.001)
+        XCTAssertNil(timeline.activeTransition(at: 3.5))
     }
 
     func testTimelineTrimAndDuration() {
@@ -249,10 +300,90 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertNil(timeline.sourceTime(at: 1))
     }
 
+    func testTimelineInsertsImportedClipAtMouseTimeAndSplitsUnderlyingClip() {
+        let originalMediaID = UUID()
+        let importedMediaID = UUID()
+        var timeline = Timeline(clips: [
+            TimelineClip(
+                id: UUID(), sourceMediaID: originalMediaID,
+                sourceStart: 0, sourceEnd: 10, timelineStart: 0
+            )
+        ])
+        let imported = TimelineClip(
+            id: UUID(), sourceMediaID: importedMediaID,
+            sourceStart: 0, sourceEnd: 3, timelineStart: 4,
+            layout: VideoClipLayout(positionX: 0.5, positionY: 0.5, scale: 0.7, opacity: 1, contentMode: .fit)
+        )
+
+        timeline.insert(imported, at: 4)
+
+        XCTAssertEqual(timeline.clips.count, 3)
+        XCTAssertEqual(timeline.clips.map(\.sourceMediaID), [originalMediaID, importedMediaID, originalMediaID])
+        XCTAssertEqual(timeline.clips[0].sourceEnd, 4, accuracy: 0.001)
+        XCTAssertEqual(timeline.clips[1].timelineStart, 4, accuracy: 0.001)
+        XCTAssertEqual(timeline.clips[2].sourceStart, 4, accuracy: 0.001)
+        XCTAssertEqual(timeline.duration, 13, accuracy: 0.001)
+    }
+
+    func testImportedVideoAndClipLayoutPersistWithProject() throws {
+        var project = sampleProject(duration: 5)
+        let media = ProjectVideoAsset(
+            id: UUID(), path: "assets/video/demo.mov", name: "Demo",
+            duration: 2, width: 1080, height: 1920, rotationQuarterTurns: 1
+        )
+        project.videoAssets = [media]
+        project.timeline.clips[0].layout = VideoClipLayout(
+            positionX: 0.35, positionY: 0.62, scale: 1.4, opacity: 0.8, contentMode: .fill
+        )
+
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: JSONEncoder().encode(project))
+
+        XCTAssertEqual(decoded.videoAssets, [media])
+        XCTAssertEqual(decoded.timeline.clips[0].layout, project.timeline.clips[0].layout)
+    }
+
     func testRecordingResolutionPreservesNonWidescreenAspect() {
         let output = RecordingResolution.fullHD.dimensions(nativeWidth: 1000, nativeHeight: 1000)
         XCTAssertEqual(output.width, 1080)
         XCTAssertEqual(output.height, 1080)
+    }
+
+    func testCapturePixelGeometryUsesSelectedDisplayScale() {
+        let retina = CapturePixelGeometry.dimensions(
+            for: CGSize(width: 1512, height: 982),
+            pointPixelScale: 2
+        )
+        let external = CapturePixelGeometry.dimensions(
+            for: CGSize(width: 2560, height: 1440),
+            pointPixelScale: 1
+        )
+
+        XCTAssertEqual(retina.width, 3024)
+        XCTAssertEqual(retina.height, 1964)
+        XCTAssertEqual(external.width, 2560)
+        XCTAssertEqual(external.height, 1440)
+    }
+
+    func testCapturePixelGeometryProducesEncoderSafeEvenDimensions() {
+        let output = CapturePixelGeometry.dimensions(
+            for: CGSize(width: 1001, height: 777),
+            pointPixelScale: 1.5
+        )
+
+        XCTAssertEqual(output.width % 2, 0)
+        XCTAssertEqual(output.height % 2, 0)
+        XCTAssertEqual(output.width, 1502)
+        XCTAssertEqual(output.height, 1166)
+    }
+
+    func testMacWindowChromeUsesNativeLikeProportions() {
+        let windowWidth = 1_200.0
+        let titlebarHeight = windowWidth * MacWindowChromeMetrics.titlebarToWindowWidth
+        let lightDiameter = titlebarHeight * MacWindowChromeMetrics.trafficLightToTitlebarHeight
+
+        XCTAssertEqual(titlebarHeight, 31.2, accuracy: 0.001)
+        XCTAssertEqual(lightDiameter, 9.984, accuracy: 0.001)
+        XCTAssertLessThan(lightDiameter, titlebarHeight * 0.35)
     }
 
     func testAreaSelectionLocksAspectAndStaysInsideCanvas() {
@@ -392,6 +523,91 @@ final class ScreenRecorderTests: XCTestCase {
         let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
         let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
         XCTAssertEqual(bytes[center], 0xD4, accuracy: 2)
+    }
+
+    func testMetalProjectRendererCompositesBrandingImage() throws {
+        let source = try makeMetalPixelBuffer(width: 96, height: 54, value: 0x22)
+        let destination = try makeMetalPixelBuffer(width: 192, height: 108, value: 0)
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 96, height: 54)
+        project.settings.appearance = .default
+        let branding = BrandingOverlay(
+            name: "Logo", assetPath: "assets/branding/logo.png",
+            startTime: 0, endTime: 1,
+            normalizedX: 0.5, normalizedY: 0.5,
+            normalizedWidth: 0.35, normalizedHeight: 0.35,
+            opacity: 1, cornerRadius: 0, contentMode: .fill
+        )
+        project.brandingOverlays = [branding]
+        let geometry = ExportGeometry(
+            outputSize: CGSize(width: 192, height: 108),
+            sourceSize: project.settings.canvas,
+            appearance: .default
+        )
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 1, preferredTimescale: 600)),
+            screenTrackID: 1,
+            cameraTrackID: nil,
+            project: project,
+            events: [],
+            geometry: geometry,
+            brandingImages: [branding.id: try makeSolidImage(red: 1, green: 0, blue: 0)]
+        )
+
+        try MetalProjectRenderer().render(
+            source: source,
+            camera: nil,
+            destination: destination,
+            compositionTime: CMTime(seconds: 0.5, preferredTimescale: 600),
+            instruction: instruction
+        )
+
+        CVPixelBufferLockBaseAddress(destination, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+        let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
+        let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
+        XCTAssertGreaterThan(bytes[center + 2], 220)
+        XCTAssertLessThan(bytes[center], 20)
+    }
+
+    func testMutedOverlayTrackIsNotRenderedByMetalCompositor() throws {
+        let source = try makeMetalPixelBuffer(width: 96, height: 54, value: 0x22)
+        let destination = try makeMetalPixelBuffer(width: 192, height: 108, value: 0)
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 96, height: 54)
+        project.settings.appearance = .default
+        let branding = BrandingOverlay(
+            name: "Logo", assetPath: "assets/branding/logo.png",
+            startTime: 0, endTime: 1,
+            normalizedX: 0.5, normalizedY: 0.5,
+            normalizedWidth: 0.35, normalizedHeight: 0.35,
+            opacity: 1, cornerRadius: 0, contentMode: .fill,
+            trackID: TimelineTrack.defaultOverlayID
+        )
+        project.brandingOverlays = [branding]
+        var mutedTrack = TimelineTrack.defaultOverlay
+        mutedTrack.isMuted = true
+        project.timelineTracks = [mutedTrack]
+        let geometry = ExportGeometry(
+            outputSize: CGSize(width: 192, height: 108),
+            sourceSize: project.settings.canvas,
+            appearance: .default
+        )
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 1, preferredTimescale: 600)),
+            screenTrackID: 1, cameraTrackID: nil,
+            project: project, events: [], geometry: geometry,
+            brandingImages: [branding.id: try makeSolidImage(red: 1, green: 0, blue: 0)]
+        )
+        try MetalProjectRenderer().render(
+            source: source, camera: nil, destination: destination,
+            compositionTime: CMTime(seconds: 0.5, preferredTimescale: 600), instruction: instruction
+        )
+        CVPixelBufferLockBaseAddress(destination, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+        let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
+        let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
+        XCTAssertLessThan(bytes[center + 2], 100)
     }
 
     func testMetalPreviewUsesSharedVideoCompositor() async throws {
@@ -560,6 +776,30 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(decoded.overlays, project.overlays)
     }
 
+    func testBrandingOverlayPersistsWithProject() throws {
+        var project = sampleProject(duration: 12)
+        let overlayTrack = TimelineTrack(id: UUID(), name: "Client Brand", kind: .overlay, isLocked: true)
+        project.timelineTracks = [overlayTrack]
+        project.brandingOverlays = [BrandingOverlay(
+            name: "Acme logo",
+            assetPath: "assets/branding/logo.png",
+            startTime: 1,
+            endTime: 9,
+            normalizedX: 0.82,
+            normalizedY: 0.84,
+            normalizedWidth: 0.2,
+            normalizedHeight: 0.12,
+            opacity: 0.72,
+            cornerRadius: 0.1,
+            contentMode: .fit,
+            trackID: overlayTrack.id
+        )]
+        let data = try JSONEncoder().encode(project)
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: data)
+        XCTAssertEqual(decoded.brandingOverlays, project.brandingOverlays)
+        XCTAssertEqual(decoded.timelineTracks, project.timelineTracks)
+    }
+
     func testNearbyClicksAreGroupedIntoOneIntent() {
         let events = [
             InteractionEvent(type: .click, timestamp: 1, normalizedX: 0.4, normalizedY: 0.5),
@@ -570,6 +810,53 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(intents.count, 1)
         XCTAssertEqual(intents[0].normalizedTargetX, 0.425, accuracy: 0.0001)
         XCTAssertGreaterThan(intents[0].zoom, 1)
+    }
+
+    func testAutoDirectorIgnoresPointerMotionAndWindowChanges() {
+        let events = [
+            InteractionEvent(type: .mouseMove, timestamp: 1, normalizedX: 0.1, normalizedY: 0.2),
+            InteractionEvent(type: .windowFocus, timestamp: 2, applicationName: "Notes"),
+            InteractionEvent(type: .scroll, timestamp: 3, normalizedX: 0.4, normalizedY: 0.5)
+        ]
+        XCTAssertTrue(AutoDirector().makeIntents(from: events, duration: 10).isEmpty)
+    }
+
+    func testAutoDirectorAnticipatesClickWithoutDriftingBeforeIt() throws {
+        let director = AutoDirector()
+        let events = [
+            InteractionEvent(type: .click, timestamp: 5, normalizedX: 0.8, normalizedY: 0.25)
+        ]
+        let intent = try XCTUnwrap(director.makeIntents(from: events, duration: 10).first)
+        XCTAssertEqual(intent.startTime, 4.68, accuracy: 0.001)
+        XCTAssertEqual(intent.focusTime, 5, accuracy: 0.001)
+
+        let frames = director.makeKeyframes(from: [intent], duration: 10)
+        let idle = try XCTUnwrap(CameraKeyframeInterpolator().value(at: 4, frames: frames))
+        let anticipation = try XCTUnwrap(CameraKeyframeInterpolator().value(at: intent.startTime, frames: frames))
+        let focused = try XCTUnwrap(CameraKeyframeInterpolator().value(at: intent.focusTime, frames: frames))
+        XCTAssertEqual(idle.centerX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(idle.scale, 1, accuracy: 0.001)
+        XCTAssertEqual(anticipation.centerX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(focused.centerX, 0.8, accuracy: 0.001)
+        XCTAssertEqual(focused.centerY, 0.25, accuracy: 0.001)
+        XCTAssertEqual(focused.scale, director.clickZoom, accuracy: 0.001)
+    }
+
+    func testAutoDirectorGroupsTypingAndUsesLatestPointerPosition() throws {
+        let events = [
+            InteractionEvent(type: .mouseMove, timestamp: 2, normalizedX: 0.22, normalizedY: 0.74),
+            InteractionEvent(type: .keyActivity, timestamp: 3, keyCode: 0, isTextInput: true),
+            InteractionEvent(type: .keyActivity, timestamp: 3.4, keyCode: 1, isTextInput: true),
+            InteractionEvent(type: .keyActivity, timestamp: 3.9, keyCode: 2, isTextInput: true)
+        ]
+        let intents = AutoDirector().makeIntents(from: events, duration: 10)
+        XCTAssertEqual(intents.count, 1)
+        let intent = try XCTUnwrap(intents.first)
+        XCTAssertEqual(intent.reason, .textInput)
+        XCTAssertEqual(intent.focusTime, 3, accuracy: 0.001)
+        XCTAssertEqual(intent.endTime, 7.4, accuracy: 0.001)
+        XCTAssertEqual(intent.normalizedTargetX, 0.22, accuracy: 0.001)
+        XCTAssertEqual(intent.normalizedTargetY, 0.74, accuracy: 0.001)
     }
 
     func testTypingAfterClickExtendsZoomAndGeneratesKeyframes() {
@@ -583,7 +870,7 @@ final class ScreenRecorderTests: XCTestCase {
 
         XCTAssertEqual(intents.first?.reason, .textInput)
         XCTAssertEqual(intents.first?.endTime, 5)
-        XCTAssertTrue(frames.contains { $0.scale > 1 && $0.easing == .spring })
+        XCTAssertTrue(frames.contains { $0.scale > 1 && $0.easing == .easeInOut })
         XCTAssertEqual(frames.last?.scale, 1)
     }
 
@@ -670,5 +957,18 @@ final class ScreenRecorderTests: XCTestCase {
         memset(CVPixelBufferGetBaseAddress(pixelBuffer), Int32(value), CVPixelBufferGetDataSize(pixelBuffer))
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
         return pixelBuffer
+    }
+
+    private func makeSolidImage(red: CGFloat, green: CGFloat, blue: CGFloat) throws -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { throw NSError(domain: "CapturaTests", code: -2) }
+        context.setFillColor(CGColor(red: red, green: green, blue: blue, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        guard let image = context.makeImage() else { throw NSError(domain: "CapturaTests", code: -3) }
+        return image
     }
 }

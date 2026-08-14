@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     @Published var openProject: OpenProject?
     @Published var recentProjects: [RecentProject] = []
     @Published var sourcePreview: NSImage?
+    @Published var liveScreenPreview: NSImage?
     @Published var isRefreshingSourcePreview = false
     @Published var sourcePreviewMessage: String?
     @Published var errorMessage: String?
@@ -46,6 +47,7 @@ final class AppModel: ObservableObject {
     private let session: RecordingSession
     private let projectStore = ProjectStore()
     private var stateTask: Task<Void, Never>?
+    private var livePreviewTask: Task<Void, Never>?
     private var clockTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
 
@@ -59,12 +61,25 @@ final class AppModel: ObservableObject {
             for await state in await session.states() {
                 guard let self else { return }
                 recordingState = state
+                switch state {
+                case .idle, .finished, .failed:
+                    liveScreenPreview = nil
+                case .preparing, .recording, .paused, .stopping:
+                    break
+                }
+            }
+        }
+        livePreviewTask = Task { [weak self, session] in
+            for await image in await session.previews() {
+                guard let self else { return }
+                liveScreenPreview = NSImage(cgImage: image, size: .zero)
             }
         }
     }
 
     deinit {
         stateTask?.cancel()
+        livePreviewTask?.cancel()
         clockTask?.cancel()
         previewTask?.cancel()
     }

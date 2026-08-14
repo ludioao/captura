@@ -18,8 +18,6 @@ struct CanvasMockupPreview: View {
     @State private var cameraDragOrigin: CGPoint?
     @State private var cameraResizeOrigin: CGSize?
 
-    private let macTitlebarRatio = 0.032
-
     var body: some View {
         Group {
             if isMetalComposed {
@@ -49,7 +47,9 @@ struct CanvasMockupPreview: View {
                 Rectangle().fill(canvasBackgroundStyle(appearance))
 
                 GeometryReader { mockupProxy in
-                    let titlebarHeight = appearance.showsWindowFrame ? mockupProxy.size.width * macTitlebarRatio : 0
+                    let titlebarHeight = appearance.showsWindowFrame
+                        ? mockupProxy.size.width * MacWindowChromeMetrics.titlebarToWindowWidth
+                        : 0
                     VStack(spacing: 0) {
                         if appearance.showsWindowFrame {
                             MacWindowTitleBar(height: titlebarHeight)
@@ -193,7 +193,7 @@ struct CanvasMockupPreview: View {
 
     private var mockupAspectRatio: Double {
         guard appearance.showsWindowFrame else { return sourceAspectRatio }
-        return 1 / (1 / sourceAspectRatio + macTitlebarRatio)
+        return 1 / (1 / sourceAspectRatio + MacWindowChromeMetrics.titlebarToWindowWidth)
     }
 
     private var windowCornerRadius: Double {
@@ -273,24 +273,18 @@ private struct MacWindowTitleBar: View {
     let height: Double
 
     var body: some View {
-        ZStack {
-            HStack(spacing: trafficLightSize * 0.68) {
-                trafficLight("#FF5F57")
-                trafficLight("#FEBC2E")
-                trafficLight("#28C840")
-                Spacer()
-            }
-            .padding(.leading, height * 0.48)
-
-            Text("captura")
-                .font(.system(size: max(8, height * 0.36), weight: .medium))
-                .foregroundStyle(.secondary)
+        HStack(spacing: trafficLightSize * (MacWindowChromeMetrics.trafficLightCenterSpacing - 1)) {
+            trafficLight("#FF5F57")
+            trafficLight("#FEBC2E")
+            trafficLight("#28C840")
+            Spacer()
         }
+        .padding(.leading, height * MacWindowChromeMetrics.trafficLightLeadingToTitlebarHeight)
         .background {
             LinearGradient(
                 colors: colorScheme == .dark
-                    ? [Color(capturaHex: "#3A3A3D"), Color(capturaHex: "#303033")]
-                    : [Color(capturaHex: "#F4F4F5"), Color(capturaHex: "#E6E6E8")],
+                    ? [Color(capturaHex: "#353537"), Color(capturaHex: "#2C2C2E")]
+                    : [Color(capturaHex: "#F3F3F4"), Color(capturaHex: "#E9E9EA")],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -305,17 +299,14 @@ private struct MacWindowTitleBar: View {
         }
     }
 
-    private var trafficLightSize: Double { max(7, min(12, height * 0.4)) }
+    private var trafficLightSize: Double {
+        max(5, min(12, height * MacWindowChromeMetrics.trafficLightToTitlebarHeight))
+    }
 
     private func trafficLight(_ hex: String) -> some View {
         Circle()
             .fill(Color(capturaHex: hex))
-            .overlay(Circle().stroke(.black.opacity(0.2), lineWidth: 0.5))
-            .overlay(alignment: .top) {
-                Circle().fill(.white.opacity(0.2)).frame(width: trafficLightSize * 0.62, height: trafficLightSize * 0.34)
-                    .padding(.top, trafficLightSize * 0.08)
-            }
-            .shadow(color: .black.opacity(0.12), radius: 0.5, y: 0.5)
+            .overlay(Circle().stroke(.black.opacity(0.18), lineWidth: 0.5))
             .frame(width: trafficLightSize, height: trafficLightSize)
     }
 }

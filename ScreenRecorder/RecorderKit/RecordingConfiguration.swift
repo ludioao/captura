@@ -25,7 +25,7 @@ enum RecordingResolution: String, Codable, CaseIterable, Sendable {
         switch self {
         case .fullHD: aspectFit(nativeWidth: nativeWidth, nativeHeight: nativeHeight, maxWidth: 1920, maxHeight: 1080)
         case .quadHD: aspectFit(nativeWidth: nativeWidth, nativeHeight: nativeHeight, maxWidth: 2560, maxHeight: 1440)
-        case .native: (nativeWidth, nativeHeight)
+        case .native: Self.encoderSafe(width: nativeWidth, height: nativeHeight)
         }
     }
 
@@ -34,6 +34,19 @@ enum RecordingResolution: String, Codable, CaseIterable, Sendable {
         let width = max(2, Int(Double(nativeWidth) * scale) / 2 * 2)
         let height = max(2, Int(Double(nativeHeight) * scale) / 2 * 2)
         return (width, height)
+    }
+
+    private static func encoderSafe(width: Int, height: Int) -> (width: Int, height: Int) {
+        (max(2, width / 2 * 2), max(2, height / 2 * 2))
+    }
+}
+
+enum CapturePixelGeometry {
+    static func dimensions(for pointSize: CGSize, pointPixelScale: CGFloat) -> (width: Int, height: Int) {
+        let scale = pointPixelScale.isFinite && pointPixelScale > 0 ? pointPixelScale : 1
+        let width = max(2, Int((pointSize.width * scale).rounded()))
+        let height = max(2, Int((pointSize.height * scale).rounded()))
+        return (width / 2 * 2, height / 2 * 2)
     }
 }
 

@@ -15,7 +15,16 @@ enum MetalPreviewCompositionBuilder {
         }
         let cameraAsset = project.media.camera.map { AVURLAsset(url: packageURL.appending(path: $0)) }
         let cameraSource = try await cameraAsset?.loadTracks(withMediaType: .video).first
-        let audioSources = try await screenAsset.loadTracks(withMediaType: .audio)
+        let primaryAudioSources = try await screenAsset.loadTracks(withMediaType: .audio)
+        var additionalVideoSources: [UUID: AVAssetTrack] = [:]
+        var additionalAudioSources: [UUID: [AVAssetTrack]] = [:]
+        for media in project.videoAssets ?? [] {
+            let asset = AVURLAsset(url: packageURL.appending(path: media.path))
+            if let video = try await asset.loadTracks(withMediaType: .video).first {
+                additionalVideoSources[media.id] = video
+                additionalAudioSources[media.id] = try await asset.loadTracks(withMediaType: .audio)
+            }
+        }
         let composition = AVMutableComposition()
         guard let screenTrack = composition.addMutableTrack(
             withMediaType: .video,
@@ -24,20 +33,24 @@ enum MetalPreviewCompositionBuilder {
         let cameraTrack = cameraSource.flatMap { _ in
             composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
         }
-        let audioTracks = audioSources.compactMap { _ in
+        let audioLaneCount = max(primaryAudioSources.count, additionalAudioSources.values.map(\.count).max() ?? 0)
+        let audioTracks = (0..<audioLaneCount).compactMap { _ in
             composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
         }
 
         var destination = CMTime.zero
         for clip in project.timeline.clips.sorted(by: { $0.timelineStart < $1.timelineStart }) {
+            let isPrimary = additionalVideoSources[clip.sourceMediaID] == nil
+            let videoSource = additionalVideoSources[clip.sourceMediaID] ?? screenSource
+            let audioSources = additionalAudioSources[clip.sourceMediaID] ?? primaryAudioSources
             let requested = CMTimeRange(
                 start: CMTime(seconds: clip.sourceStart, preferredTimescale: 600),
                 duration: CMTime(seconds: clip.sourceDuration, preferredTimescale: 600)
             )
-            let range = CMTimeRangeGetIntersection(requested, otherRange: try await screenSource.load(.timeRange))
+            let range = CMTimeRangeGetIntersection(requested, otherRange: try await videoSource.load(.timeRange))
             guard range.duration > .zero else { continue }
-            try screenTrack.insertTimeRange(range, of: screenSource, at: destination)
-            if let cameraSource, let cameraTrack {
+            try screenTrack.insertTimeRange(range, of: videoSource, at: destination)
+            if isPrimary, let cameraSource, let cameraTrack {
                 let available = CMTimeRangeGetIntersection(range, otherRange: try await cameraSource.load(.timeRange))
                 if available.duration > .zero { try cameraTrack.insertTimeRange(available, of: cameraSource, at: destination) }
             }
@@ -67,7 +80,8 @@ enum MetalPreviewCompositionBuilder {
             cameraTrackID: cameraTrack?.trackID,
             project: project,
             events: events,
-            geometry: geometry
+            geometry: geometry,
+            brandingImages: BrandingAssetLoader.load(project: project, packageURL: packageURL)
         )]
         videoComposition.renderSize = size
         videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, project.settings.frameRate)))

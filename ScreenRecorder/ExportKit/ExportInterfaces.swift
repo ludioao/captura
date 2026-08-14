@@ -89,10 +89,12 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         let events = (try? JSONDecoder().decode([InteractionEvent].self, from: Data(contentsOf: eventsURL))) ?? []
         let prepared = try await makeComposition(
             project: project,
+            packageURL: packageURL,
             screenAsset: screenAsset,
             cameraAsset: cameraAsset,
             events: events,
-            settings: settings
+            settings: settings,
+            brandingImages: BrandingAssetLoader.load(project: project, packageURL: packageURL)
         )
         defer { prepared.temporaryFiles.forEach { try? FileManager.default.removeItem(at: $0) } }
 
@@ -168,10 +170,12 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
 
     private func makeComposition(
         project: ScreenProject,
+        packageURL: URL,
         screenAsset: AVURLAsset,
         cameraAsset: AVURLAsset?,
         events: [InteractionEvent],
-        settings: ExportSettings
+        settings: ExportSettings,
+        brandingImages: [UUID: CGImage]
     ) async throws -> PreparedComposition {
         guard let screenSource = try await screenAsset.loadTracks(withMediaType: .video).first else {
             throw ExportError.missingScreenMedia
@@ -184,21 +188,34 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         let cameraTrack = cameraSource.flatMap {
             _ in composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
         }
-        let audioSources = try await screenAsset.loadTracks(withMediaType: .audio)
-        let audioTracks = audioSources.compactMap {
-            _ in composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+        let primaryAudioSources = try await screenAsset.loadTracks(withMediaType: .audio)
+        var additionalVideoSources: [UUID: AVAssetTrack] = [:]
+        var additionalAudioSources: [UUID: [AVAssetTrack]] = [:]
+        for media in project.videoAssets ?? [] {
+            let asset = AVURLAsset(url: packageURL.appending(path: media.path))
+            if let video = try await asset.loadTracks(withMediaType: .video).first {
+                additionalVideoSources[media.id] = video
+                additionalAudioSources[media.id] = try await asset.loadTracks(withMediaType: .audio)
+            }
+        }
+        let audioLaneCount = max(primaryAudioSources.count, additionalAudioSources.values.map(\.count).max() ?? 0)
+        let audioTracks = (0..<audioLaneCount).compactMap { _ in
+            composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
         }
 
         let clips = project.timeline.clips.sorted { $0.timelineStart < $1.timelineStart }
         var destinationCursor = CMTime.zero
         for clip in clips {
+            let isPrimary = additionalVideoSources[clip.sourceMediaID] == nil
+            let videoSource = additionalVideoSources[clip.sourceMediaID] ?? screenSource
+            let audioSources = additionalAudioSources[clip.sourceMediaID] ?? primaryAudioSources
             let requested = CMTimeRange(
                 start: CMTime(seconds: clip.sourceStart, preferredTimescale: 600),
                 duration: CMTime(seconds: clip.sourceDuration, preferredTimescale: 600)
             )
-            let screenRange = CMTimeRangeGetIntersection(requested, otherRange: try await screenSource.load(.timeRange))
+            let screenRange = CMTimeRangeGetIntersection(requested, otherRange: try await videoSource.load(.timeRange))
             guard screenRange.duration > .zero else { continue }
-            try screenTrack.insertTimeRange(screenRange, of: screenSource, at: destinationCursor)
+            try screenTrack.insertTimeRange(screenRange, of: videoSource, at: destinationCursor)
 
             for (source, target) in zip(audioSources, audioTracks) {
                 let available = CMTimeRangeGetIntersection(screenRange, otherRange: try await source.load(.timeRange))
@@ -207,7 +224,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
                 try target.insertTimeRange(available, of: source, at: audioDestination)
             }
 
-            if let cameraSource, let cameraTrack {
+            if isPrimary, let cameraSource, let cameraTrack {
                 let available = CMTimeRangeGetIntersection(screenRange, otherRange: try await cameraSource.load(.timeRange))
                 if available.duration > .zero {
                     let cameraDestination = CMTimeAdd(destinationCursor, CMTimeSubtract(available.start, screenRange.start))
@@ -268,7 +285,8 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
             cameraTrackID: cameraTrack?.trackID,
             project: project,
             events: events,
-            geometry: geometry
+            geometry: geometry,
+            brandingImages: brandingImages
         )
 
         let videoComposition = AVMutableVideoComposition()
@@ -616,7 +634,7 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
     private func addMacWindowChrome(to root: CALayer, geometry: ExportGeometry) {
         let titlebar = CAGradientLayer()
         titlebar.frame = geometry.titlebarRect
-        titlebar.colors = [NSColor(calibratedWhite: 0.96, alpha: 1).cgColor, NSColor(calibratedWhite: 0.88, alpha: 1).cgColor]
+        titlebar.colors = [NSColor(calibratedWhite: 0.95, alpha: 1).cgColor, NSColor(calibratedWhite: 0.91, alpha: 1).cgColor]
         titlebar.startPoint = CGPoint(x: 0.5, y: 0)
         titlebar.endPoint = CGPoint(x: 0.5, y: 1)
         root.addSublayer(titlebar)
@@ -626,13 +644,13 @@ final class MP4ProjectExporter: @unchecked Sendable, ProjectExporter {
         separator.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
         root.addSublayer(separator)
 
-        let diameter = max(8, geometry.titlebarRect.height * 0.4)
-        let spacing = diameter * 0.68
-        let leading = geometry.titlebarRect.height * 0.48
+        let diameter = max(6, geometry.titlebarRect.height * MacWindowChromeMetrics.trafficLightToTitlebarHeight)
+        let centerSpacing = diameter * MacWindowChromeMetrics.trafficLightCenterSpacing
+        let leading = geometry.titlebarRect.height * MacWindowChromeMetrics.trafficLightLeadingToTitlebarHeight
         for (index, color) in ["#FF5F57", "#FEBC2E", "#28C840"].enumerated() {
             let light = CALayer()
             light.frame = CGRect(
-                x: geometry.titlebarRect.minX + leading + Double(index) * (diameter + spacing),
+                x: geometry.titlebarRect.minX + leading + Double(index) * centerSpacing,
                 y: geometry.titlebarRect.midY - diameter / 2,
                 width: diameter,
                 height: diameter
@@ -684,7 +702,7 @@ struct ExportGeometry: Sendable {
         let padding = max(16 * scale, appearance.padding * scale)
         let available = CGRect(x: padding, y: padding, width: max(2, outputSize.width - padding * 2), height: max(2, outputSize.height - padding * 2))
         let sourceAspect = Double(sourceSize.width) / Double(max(1, sourceSize.height))
-        let titleRatio = appearance.showsWindowFrame ? 0.032 : 0
+        let titleRatio = appearance.showsWindowFrame ? MacWindowChromeMetrics.titlebarToWindowWidth : 0
         let outerAspect = 1 / (1 / sourceAspect + titleRatio)
         let width: Double
         let height: Double

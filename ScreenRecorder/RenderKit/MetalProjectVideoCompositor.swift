@@ -2,7 +2,9 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import ImageIO
 import Metal
+import MetalKit
 import simd
 
 final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
@@ -16,6 +18,7 @@ final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProt
     let project: ScreenProject
     let events: [InteractionEvent]
     let geometry: ExportGeometry
+    let brandingImages: [UUID: CGImage]
 
     init(
         timeRange: CMTimeRange,
@@ -23,7 +26,8 @@ final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProt
         cameraTrackID: CMPersistentTrackID?,
         project: ScreenProject,
         events: [InteractionEvent],
-        geometry: ExportGeometry
+        geometry: ExportGeometry,
+        brandingImages: [UUID: CGImage] = [:]
     ) {
         self.timeRange = timeRange
         self.screenTrackID = screenTrackID
@@ -31,10 +35,22 @@ final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProt
         self.project = project
         self.events = events
         self.geometry = geometry
+        self.brandingImages = brandingImages
         requiredSourceTrackIDs = [screenTrackID, cameraTrackID].compactMap { id in
             guard let id else { return nil }
             return NSNumber(value: id)
         }
+    }
+}
+
+enum BrandingAssetLoader {
+    static func load(project: ScreenProject, packageURL: URL) -> [UUID: CGImage] {
+        Dictionary(uniqueKeysWithValues: (project.brandingOverlays ?? []).compactMap { overlay in
+            let url = packageURL.appending(path: overlay.assetPath)
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            return (overlay.id, image)
+        })
     }
 }
 
@@ -108,6 +124,11 @@ final class MetalProjectRenderer: @unchecked Sendable {
         var cursor: SIMD4<Float>
         var chrome: SIMD4<Float>
         var output: SIMD4<Float>
+        var transition: SIMD4<Float>
+        var videoRect: SIMD4<Float>
+        var video: SIMD4<Float>
+        var brandingRect: SIMD4<Float>
+        var branding: SIMD4<Float>
     }
 
     private struct GPUOverlay {
@@ -118,6 +139,8 @@ final class MetalProjectRenderer: @unchecked Sendable {
     private let commandQueue: MTLCommandQueue
     private let textureCache: CVMetalTextureCache
     private let pipeline: MTLRenderPipelineState
+    private let textureLoader: MTKTextureLoader
+    private var brandingTextureCache: [UUID: MTLTexture] = [:]
     private let lock = NSLock()
 
     init() throws {
@@ -125,6 +148,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             throw MetalCompositorError.unavailable
         }
         self.commandQueue = commandQueue
+        textureLoader = MTKTextureLoader(device: device)
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else { throw MetalCompositorError.unavailable }
@@ -155,16 +179,27 @@ final class MetalProjectRenderer: @unchecked Sendable {
             }
             let cameraTexture = camera.flatMap(texture(from:)) ?? sourceTexture
             let timelineTime = max(0, compositionTime.seconds)
+            let activeClip = instruction.project.timeline.clip(at: timelineTime)
+            let importedMedia = activeClip.flatMap { clip in
+                instruction.project.videoAssets?.first { $0.id == clip.sourceMediaID }
+            }
+            let isPrimaryClip = importedMedia == nil
             let sourceTime = instruction.project.timeline.sourceTime(at: timelineTime) ?? timelineTime
-            let keyframe = CameraKeyframeInterpolator().value(
+            let keyframe = isPrimaryClip ? CameraKeyframeInterpolator().value(
                 at: sourceTime,
                 frames: instruction.project.cameraKeyframes
-            )
-            let cursor = cursorSample(at: sourceTime, instruction: instruction)
+            ) : nil
+            let cursor = isPrimaryClip ? cursorSample(at: sourceTime, instruction: instruction) : nil
             let appearance = instruction.project.settings.appearance ?? .default
             let colors = backgroundColors(appearance)
             let geometry = instruction.geometry
             let outputSize = geometry.outputSize
+            let activeTransition = instruction.project.timeline.activeTransition(at: timelineTime)
+            let mutedTracks = Set((instruction.project.timelineTracks ?? []).filter(\.isMuted).map(\.id))
+            let activeBranding = (instruction.project.brandingOverlays ?? []).last {
+                timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
+                !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultOverlayID)
+            }
             let webcamLayout = WebcamLayoutInterpolator().value(
                 at: timelineTime,
                 frames: instruction.project.webcamKeyframes ?? [],
@@ -188,6 +223,27 @@ final class MetalProjectRenderer: @unchecked Sendable {
                     Float(rect.width / outputSize.width), Float(rect.height / outputSize.height)
                 )
             }
+            let layout = activeClip?.layout ?? .default
+            let sourceAspect = Double(importedMedia.map { Double($0.width) / Double(max(1, $0.height)) }
+                ?? Double(instruction.project.settings.sourceDisplay.width) / Double(max(1, instruction.project.settings.sourceDisplay.height)))
+            let destinationAspect = geometry.screenRect.width / max(geometry.screenRect.height, 1)
+            var relativeWidth = min(max(layout.scale, 0.05), 2)
+            var relativeHeight = relativeWidth
+            if layout.contentMode == .fit {
+                if sourceAspect > destinationAspect { relativeHeight *= destinationAspect / sourceAspect }
+                else { relativeWidth *= sourceAspect / destinationAspect }
+            }
+            let videoRect = CGRect(
+                x: geometry.screenRect.minX + geometry.screenRect.width * (layout.positionX - relativeWidth / 2),
+                y: geometry.screenRect.minY + geometry.screenRect.height * (layout.positionY - relativeHeight / 2),
+                width: geometry.screenRect.width * relativeWidth,
+                height: geometry.screenRect.height * relativeHeight
+            )
+            let brandingImage = activeBranding.flatMap { instruction.brandingImages[$0.id] }
+            let brandingTexture = activeBranding.flatMap { overlay in
+                cachedBrandingTexture(for: overlay.id, image: brandingImage)
+            } ?? sourceTexture
+            let brandingAspect = brandingImage.map { Float($0.width) / Float(max(1, $0.height)) } ?? 1
             var uniforms = Uniforms(
                 backgroundStart: colors.0,
                 backgroundEnd: colors.1,
@@ -197,7 +253,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 cameraFocus: SIMD4(
                     Float(keyframe?.centerX ?? 0.5), Float(keyframe?.centerY ?? 0.5),
                     Float(max(1, keyframe?.scale ?? 1)),
-                    camera == nil ? 0 : Float(min(max(webcamLayout.opacity, 0), 1))
+                    camera == nil || !isPrimaryClip ? 0 : Float(min(max(webcamLayout.opacity, 0), 1))
                 ),
                 cursor: SIMD4(
                     Float(cursor?.normalizedX ?? 0.5), Float(cursor?.normalizedY ?? 0.5),
@@ -210,7 +266,31 @@ final class MetalProjectRenderer: @unchecked Sendable {
                     Float((instruction.project.settings.appearance ?? .default).shadowStrength * geometry.scale / outputSize.width),
                     0
                 ),
-                output: SIMD4(Float(outputSize.width), Float(outputSize.height), 0, 0)
+                output: SIMD4(Float(outputSize.width), Float(outputSize.height), 0, 0),
+                transition: SIMD4(
+                    transitionCode(activeTransition?.kind),
+                    Float(activeTransition?.intensity ?? 0), 0, 0
+                ),
+                videoRect: normalize(videoRect),
+                video: SIMD4(
+                    Float(min(max(layout.opacity, 0), 1)),
+                    layout.contentMode == .fill ? 1 : 0,
+                    Float(sourceAspect),
+                    Float(importedMedia?.rotationQuarterTurns ?? 0)
+                ),
+                brandingRect: activeBranding.map {
+                    SIMD4(
+                        Float($0.normalizedX - $0.normalizedWidth / 2),
+                        Float($0.normalizedY - $0.normalizedHeight / 2),
+                        Float($0.normalizedWidth), Float($0.normalizedHeight)
+                    )
+                } ?? .zero,
+                branding: SIMD4(
+                    brandingImage == nil ? 0 : Float(min(max(activeBranding?.opacity ?? 0, 0), 1)),
+                    activeBranding?.contentMode == .fill ? 1 : 0,
+                    brandingAspect,
+                    Float(activeBranding?.cornerRadius ?? 0)
+                )
             )
             var overlays = activeOverlays(at: timelineTime, instruction: instruction)
             if overlays.isEmpty {
@@ -229,6 +309,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             encoder.setRenderPipelineState(pipeline)
             encoder.setFragmentTexture(sourceTexture, index: 0)
             encoder.setFragmentTexture(cameraTexture, index: 1)
+            encoder.setFragmentTexture(brandingTexture, index: 2)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             encoder.setFragmentBytes(&overlays, length: MemoryLayout<GPUOverlay>.stride * overlays.count, index: 1)
             encoder.setFragmentBytes(&overlayCount, length: MemoryLayout<UInt32>.stride, index: 2)
@@ -250,6 +331,26 @@ final class MetalProjectRenderer: @unchecked Sendable {
             width, height, 0, &image
         ) == kCVReturnSuccess, let image else { return nil }
         return CVMetalTextureGetTexture(image)
+    }
+
+    private func cachedBrandingTexture(for id: UUID, image: CGImage?) -> MTLTexture? {
+        if let cached = brandingTextureCache[id] { return cached }
+        guard let image,
+              let texture = try? textureLoader.newTexture(
+                cgImage: image,
+                options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
+              ) else { return nil }
+        brandingTextureCache[id] = texture
+        return texture
+    }
+
+    private func transitionCode(_ kind: ClipTransitionKind?) -> Float {
+        switch kind {
+        case .fade: 1
+        case .flash: 2
+        case .zoom: 3
+        case nil: 0
+        }
     }
 
     private func cursorSample(at sourceTime: Double, instruction: CapturaVideoInstruction) -> CursorSample? {
@@ -314,6 +415,8 @@ final class MetalProjectRenderer: @unchecked Sendable {
         float4 backgroundStart; float4 backgroundEnd;
         float4 windowRect; float4 screenRect; float4 cameraRect;
         float4 cameraFocus; float4 cursor; float4 chrome; float4 output;
+        float4 transition; float4 videoRect; float4 video;
+        float4 brandingRect; float4 branding;
     };
     struct Overlay { float4 rect; float4 values; };
 
@@ -353,6 +456,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         VertexOut in [[stage_in]],
         texture2d<float> screen [[texture(0)]],
         texture2d<float> camera [[texture(1)]],
+        texture2d<float> brandingTexture [[texture(2)]],
         constant Uniforms &u [[buffer(0)]],
         constant Overlay *overlays [[buffer(1)]],
         constant uint &overlayCount [[buffer(2)]]) {
@@ -365,9 +469,21 @@ final class MetalProjectRenderer: @unchecked Sendable {
         color = mix(color, float4(0,0,0,1), shadow * (1.0 - windowMask) * 0.22);
         if (windowMask > 0.001) color = mix(color, float4(0.055,0.055,0.065,1), windowMask);
 
-        if (inside(uv, u.screenRect)) {
-            float2 local = (uv - u.screenRect.xy) / u.screenRect.zw;
+        if (inside(uv, u.videoRect)) {
+            float2 local = (uv - u.videoRect.xy) / u.videoRect.zw;
             float2 sourceUV = u.cameraFocus.xy + (local - 0.5) / max(u.cameraFocus.z, 1.0);
+            float destinationAspect = (u.videoRect.z * u.output.x) / max(u.videoRect.w * u.output.y, 1.0);
+            if (u.video.y > 0.5) {
+                if (u.video.z > destinationAspect) sourceUV.x = (sourceUV.x - 0.5) * destinationAspect / u.video.z + 0.5;
+                else sourceUV.y = (sourceUV.y - 0.5) * u.video.z / destinationAspect + 0.5;
+            }
+            int rotations = (int(u.video.w) % 4 + 4) % 4;
+            if (rotations == 1) sourceUV = float2(sourceUV.y, 1.0 - sourceUV.x);
+            else if (rotations == 2) sourceUV = 1.0 - sourceUV;
+            else if (rotations == 3) sourceUV = float2(1.0 - sourceUV.y, sourceUV.x);
+            if (u.transition.x > 2.5) {
+                sourceUV = 0.5 + (sourceUV - 0.5) / (1.0 + u.transition.y * 0.1);
+            }
             float4 video = screen.sample(s, sourceUV);
             for (uint index = 0; index < overlayCount; index++) {
                 if (!inside(local, overlays[index].rect)) continue;
@@ -379,7 +495,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                     video.rgb = mix(video.rgb, float3(1.0, 0.74, 0.08), 0.13 + border * 0.7);
                 }
             }
-            color = video;
+            color = mix(color, video, u.video.x);
 
             if (u.cursor.z > 0.5) {
                 float2 cursorLocal = (u.cursor.xy - u.cameraFocus.xy) * u.cameraFocus.z + 0.5;
@@ -406,16 +522,55 @@ final class MetalProjectRenderer: @unchecked Sendable {
             color = mix(color, cameraColor, cameraMask * u.cameraFocus.w);
         }
 
-        if (u.chrome.x > 0.5 && inside(uv, float4(u.windowRect.xy, u.windowRect.z, u.screenRect.y - u.windowRect.y))) {
+        if (u.chrome.x > 0.5 && windowMask > 0.5 && inside(uv, float4(u.windowRect.xy, u.windowRect.z, u.screenRect.y - u.windowRect.y))) {
             float titleAmount = (uv.y - u.windowRect.y) / max(u.screenRect.y - u.windowRect.y, 0.001);
-            color = mix(float4(0.96,0.96,0.97,1), float4(0.86,0.86,0.88,1), titleAmount);
-            float radius = (u.screenRect.y - u.windowRect.y) * 0.19;
-            float startX = u.windowRect.x + (u.screenRect.y - u.windowRect.y) * 0.48;
-            float centerY = (u.windowRect.y + u.screenRect.y) * 0.5;
+            color = mix(float4(0.95,0.95,0.955,1), float4(0.91,0.91,0.915,1), titleAmount);
+            if (titleAmount > 0.975) color.rgb *= 0.86;
+
+            // Use output pixels for distances. In normalized UV space, a circle
+            // becomes a horizontal pill whenever the video is not square.
+            float titleHeightPixels = (u.screenRect.y - u.windowRect.y) * u.output.y;
+            float radiusPixels = titleHeightPixels * 0.16;
+            float startX = u.windowRect.x * u.output.x + titleHeightPixels * 0.36;
+            float centerY = (u.windowRect.y + u.screenRect.y) * 0.5 * u.output.y;
+            float2 pixel = uv * u.output.xy;
             const float3 lights[3] = { float3(1,0.37,0.34), float3(1,0.74,0.18), float3(0.16,0.78,0.25) };
             for (int i = 0; i < 3; i++) {
-                float2 center = float2(startX + float(i) * radius * 3.35, centerY);
-                if (distance(uv, center) < radius) color = float4(lights[i], 1);
+                float2 center = float2(startX + float(i) * radiusPixels * 3.36, centerY);
+                float distanceToLight = distance(pixel, center);
+                if (distanceToLight < radiusPixels) {
+                    float edge = smoothstep(radiusPixels - 1.0, radiusPixels, distanceToLight);
+                    color = float4(mix(lights[i], lights[i] * 0.62, edge), 1);
+                }
+            }
+        }
+
+        if (u.transition.x > 0.5 && u.transition.x < 1.5) {
+            color = mix(color, float4(0.015, 0.015, 0.02, 1), u.transition.y);
+        } else if (u.transition.x > 1.5 && u.transition.x < 2.5) {
+            color = mix(color, float4(1, 1, 1, 1), u.transition.y * 0.94);
+        }
+
+        if (u.branding.x > 0.001 && inside(uv, u.brandingRect)) {
+            float2 imageUV = (uv - u.brandingRect.xy) / u.brandingRect.zw;
+            float destinationAspect = (u.brandingRect.z * u.output.x) / max(u.brandingRect.w * u.output.y, 1.0);
+            float imageAspect = max(u.branding.z, 0.001);
+            if (u.branding.y < 0.5) {
+                if (imageAspect > destinationAspect) {
+                    imageUV.y = (imageUV.y - 0.5) * imageAspect / destinationAspect + 0.5;
+                } else {
+                    imageUV.x = (imageUV.x - 0.5) * destinationAspect / imageAspect + 0.5;
+                }
+            } else if (imageAspect > destinationAspect) {
+                imageUV.x = (imageUV.x - 0.5) * destinationAspect / imageAspect + 0.5;
+            } else {
+                imageUV.y = (imageUV.y - 0.5) * imageAspect / destinationAspect + 0.5;
+            }
+            if (all(imageUV >= 0.0) && all(imageUV <= 1.0)) {
+                float4 brandColor = brandingTexture.sample(s, imageUV);
+                float radius = min(u.brandingRect.z, u.brandingRect.w) * u.branding.w;
+                float brandMask = roundedMask(uv, u.brandingRect, radius);
+                color = mix(color, brandColor, brandColor.a * u.branding.x * brandMask);
             }
         }
         return color;

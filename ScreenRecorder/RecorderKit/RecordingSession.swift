@@ -13,6 +13,7 @@ actor RecordingSession {
     private var timeline: CaptureTimeline?
     private var state: RecordingState = .idle
     private var observers: [UUID: AsyncStream<RecordingState>.Continuation] = [:]
+    private var previewObservers: [UUID: AsyncStream<CGImage>.Continuation] = [:]
 
     init(
         projectStore: ProjectStore = ProjectStore(),
@@ -35,6 +36,16 @@ actor RecordingSession {
             continuation.yield(state)
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeObserver(id) }
+            }
+        }
+    }
+
+    func previews() -> AsyncStream<CGImage> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            previewObservers[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removePreviewObserver(id) }
             }
         }
     }
@@ -77,6 +88,9 @@ actor RecordingSession {
                         configuration: configuration,
                         outputURL: package.screenMediaURL,
                         timeline: timeline,
+                        previewHandler: { [weak self] image in
+                            Task { await self?.publishPreview(image) }
+                        },
                         failureHandler: { [weak self] error in
                             Task { await self?.captureDidFail(error) }
                         }
@@ -217,6 +231,14 @@ actor RecordingSession {
 
     private func removeObserver(_ id: UUID) {
         observers.removeValue(forKey: id)
+    }
+
+    private func removePreviewObserver(_ id: UUID) {
+        previewObservers.removeValue(forKey: id)
+    }
+
+    private func publishPreview(_ image: CGImage) {
+        previewObservers.values.forEach { $0.yield(image) }
     }
 
     private func captureDidFail(_ error: RecorderError) async {

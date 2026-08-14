@@ -1,5 +1,12 @@
 import Foundation
 
+enum MacWindowChromeMetrics {
+    static let titlebarToWindowWidth = 0.026
+    static let trafficLightToTitlebarHeight = 0.32
+    static let trafficLightLeadingToTitlebarHeight = 0.36
+    static let trafficLightCenterSpacing = 1.68
+}
+
 struct CanvasSize: Codable, Hashable, Sendable {
     var width: Int
     var height: Int
@@ -10,6 +17,16 @@ struct ProjectMedia: Codable, Hashable, Sendable {
     var microphone: String? = nil
     var systemAudio: String? = nil
     var camera: String? = nil
+}
+
+struct ProjectVideoAsset: Codable, Identifiable, Hashable, Sendable {
+    var id: UUID
+    var path: String
+    var name: String
+    var duration: Double
+    var width: Int
+    var height: Int
+    var rotationQuarterTurns: Int = 0
 }
 
 enum CanvasBackgroundPreset: String, Codable, CaseIterable, Hashable, Sendable {
@@ -189,6 +206,49 @@ struct OverlayRegion: Codable, Identifiable, Hashable, Sendable {
     var kind: OverlayRegionKind
 }
 
+enum BrandingContentMode: String, Codable, CaseIterable, Hashable, Sendable {
+    case fit
+    case fill
+
+    var displayName: String { self == .fit ? "Fit" : "Fill" }
+}
+
+enum TimelineTrackKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case video
+    case overlay
+    case audio
+}
+
+struct TimelineTrack: Codable, Identifiable, Hashable, Sendable {
+    static let primaryVideoID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
+    static let defaultOverlayID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
+
+    var id: UUID
+    var name: String
+    var kind: TimelineTrackKind
+    var isLocked = false
+    var isMuted = false
+
+    static let primaryVideo = TimelineTrack(id: primaryVideoID, name: "Screen", kind: .video)
+    static let defaultOverlay = TimelineTrack(id: defaultOverlayID, name: "Branding", kind: .overlay)
+}
+
+struct BrandingOverlay: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var name: String
+    var assetPath: String
+    var startTime: Double
+    var endTime: Double
+    var normalizedX: Double = 0.86
+    var normalizedY: Double = 0.86
+    var normalizedWidth: Double = 0.18
+    var normalizedHeight: Double = 0.18
+    var opacity: Double = 1
+    var cornerRadius: Double = 0.08
+    var contentMode: BrandingContentMode = .fit
+    var trackID: UUID? = nil
+}
+
 struct WebcamLayoutKeyframe: Codable, Identifiable, Hashable, Sendable {
     var id = UUID()
     var time: Double
@@ -298,6 +358,9 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var captions: [CaptionCue]? = nil
     var overlays: [OverlayRegion]? = nil
     var webcamKeyframes: [WebcamLayoutKeyframe]? = nil
+    var brandingOverlays: [BrandingOverlay]? = nil
+    var timelineTracks: [TimelineTrack]? = nil
+    var videoAssets: [ProjectVideoAsset]? = nil
 }
 
 struct CapturaPreset: Codable, Identifiable, Hashable, Sendable {

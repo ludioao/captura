@@ -2,6 +2,7 @@
 import CoreGraphics
 import CoreMedia
 import Foundation
+import VideoToolbox
 
 struct CaptureDetails: Sendable {
     let displayFrame: CGRect
@@ -16,6 +17,8 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var stream: SCStream?
     private var writer: MediaWriter?
     private var failureHandler: (@Sendable (RecorderError) -> Void)?
+    private var previewHandler: (@Sendable (CGImage) -> Void)?
+    private var lastPreviewTime = CMTime.invalid
 
     static func availableDisplays() async throws -> [DisplayChoice] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -47,13 +50,12 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         configuration: RecordingConfiguration,
         outputURL: URL,
         timeline: CaptureTimeline,
+        previewHandler: @escaping @Sendable (CGImage) -> Void,
         failureHandler: @escaping @Sendable (RecorderError) -> Void
     ) async throws -> CaptureDetails {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let filter: SCContentFilter
         let displayFrame: CGRect
-        let sourceWidth: Int
-        let sourceHeight: Int
         var sourceRect: CGRect?
         if let windowID = configuration.windowID {
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
@@ -61,8 +63,6 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             }
             filter = SCContentFilter(desktopIndependentWindow: window)
             displayFrame = window.frame
-            sourceWidth = max(2, Int(window.frame.width * 2))
-            sourceHeight = max(2, Int(window.frame.height * 2))
         } else {
             guard let display = content.displays.first(where: { $0.displayID == configuration.displayID }) else {
                 throw RecorderError.displayUnavailable
@@ -71,32 +71,37 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             filter = SCContentFilter(display: display, excludingApplications: excludedApplications, exceptingWindows: [])
             if let normalized = configuration.normalizedCropRect {
                 let crop = CGRect(
-                    x: min(max(normalized.minX, 0), 0.98) * Double(display.width),
-                    y: min(max(normalized.minY, 0), 0.98) * Double(display.height),
-                    width: min(max(normalized.width, 0.02), 1) * Double(display.width),
-                    height: min(max(normalized.height, 0.02), 1) * Double(display.height)
+                    x: min(max(normalized.minX, 0), 0.98) * display.frame.width,
+                    y: min(max(normalized.minY, 0), 0.98) * display.frame.height,
+                    width: min(max(normalized.width, 0.02), 1) * display.frame.width,
+                    height: min(max(normalized.height, 0.02), 1) * display.frame.height
                 ).integral
                 sourceRect = crop
-                sourceWidth = max(2, Int(crop.width))
-                sourceHeight = max(2, Int(crop.height))
-                let scaleX = Double(display.width) / max(display.frame.width, 1)
-                let scaleY = Double(display.height) / max(display.frame.height, 1)
                 displayFrame = CGRect(
-                    x: display.frame.minX + crop.minX / scaleX,
-                    y: display.frame.minY + crop.minY / scaleY,
-                    width: crop.width / scaleX,
-                    height: crop.height / scaleY
+                    x: display.frame.minX + crop.minX,
+                    y: display.frame.minY + crop.minY,
+                    width: crop.width,
+                    height: crop.height
                 )
             } else {
                 displayFrame = display.frame
-                sourceWidth = display.width
-                sourceHeight = display.height
             }
         }
+        // ScreenCaptureKit expresses filter/content rectangles in points, while the
+        // stream surface and encoder dimensions are pixels. The scale belongs to the
+        // selected filter and can differ between displays in a multi-monitor setup.
+        let capturePointSize = sourceRect?.size ?? filter.contentRect.size
+        let native = CapturePixelGeometry.dimensions(
+            for: capturePointSize,
+            pointPixelScale: CGFloat(filter.pointPixelScale)
+        )
+        let sourceWidth = native.width
+        let sourceHeight = native.height
         let output = configuration.resolution.dimensions(nativeWidth: sourceWidth, nativeHeight: sourceHeight)
         let streamConfiguration = SCStreamConfiguration()
         streamConfiguration.width = output.width
         streamConfiguration.height = output.height
+        streamConfiguration.destinationRect = CGRect(x: 0, y: 0, width: output.width, height: output.height)
         if let sourceRect { streamConfiguration.sourceRect = sourceRect }
         streamConfiguration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(configuration.frameRate))
         streamConfiguration.queueDepth = 6
@@ -130,7 +135,9 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             }
             self.writer = writer
             self.stream = stream
+            self.previewHandler = previewHandler
             self.failureHandler = failureHandler
+            lastPreviewTime = .invalid
             try await stream.startCapture()
         } catch {
             self.stream = nil
@@ -153,6 +160,7 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
             catch { Log.capture.warning("ScreenCaptureKit stop returned: \(error.localizedDescription)") }
         }
         self.stream = nil
+        previewHandler = nil
         guard let writer else { throw RecorderError.invalidState }
         self.writer = nil
         return try await writer.finish()
@@ -166,7 +174,9 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
         guard sampleBuffer.isValid else { return }
         switch type {
         case .screen:
-            writer?.appendVideo(sampleBuffer, dropped: frameWasDropped(sampleBuffer))
+            let dropped = frameWasDropped(sampleBuffer)
+            writer?.appendVideo(sampleBuffer, dropped: dropped)
+            if !dropped { publishPreview(from: sampleBuffer) }
         case .audio:
             writer?.appendAudio(sampleBuffer)
         case .microphone:
@@ -181,5 +191,20 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @un
               let statusNumber = attachments.first?[.status] as? NSNumber,
               let status = SCFrameStatus(rawValue: statusNumber.intValue) else { return true }
         return status != .complete
+    }
+
+    private func publishPreview(from sampleBuffer: CMSampleBuffer) {
+        guard let previewHandler,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if lastPreviewTime.isValid,
+           CMTimeGetSeconds(CMTimeSubtract(presentationTime, lastPreviewTime)) < 1.0 / 15.0 {
+            return
+        }
+        var image: CGImage?
+        guard VTCreateCGImageFromCVPixelBuffer(imageBuffer, options: nil, imageOut: &image) == noErr,
+              let image else { return }
+        lastPreviewTime = presentationTime
+        previewHandler(image)
     }
 }

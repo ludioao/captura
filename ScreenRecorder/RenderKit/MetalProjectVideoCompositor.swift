@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreMedia
+import CoreText
 import CoreVideo
 import Foundation
 import ImageIO
@@ -129,6 +130,8 @@ final class MetalProjectRenderer: @unchecked Sendable {
         var video: SIMD4<Float>
         var brandingRect: SIMD4<Float>
         var branding: SIMD4<Float>
+        var textRect: SIMD4<Float>
+        var text: SIMD4<Float>
     }
 
     private struct GPUOverlay {
@@ -141,6 +144,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
     private let pipeline: MTLRenderPipelineState
     private let textureLoader: MTKTextureLoader
     private var brandingTextureCache: [UUID: MTLTexture] = [:]
+    private var textTextureCache: [TextOverlay: MTLTexture] = [:]
     private let lock = NSLock()
 
     init() throws {
@@ -200,6 +204,10 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
                 !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultOverlayID)
             }
+            let activeText = (instruction.project.textOverlays ?? []).last {
+                timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
+                !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultTextID)
+            }
             let webcamLayout = WebcamLayoutInterpolator().value(
                 at: timelineTime,
                 frames: instruction.project.webcamKeyframes ?? [],
@@ -244,6 +252,8 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 cachedBrandingTexture(for: overlay.id, image: brandingImage)
             } ?? sourceTexture
             let brandingAspect = brandingImage.map { Float($0.width) / Float(max(1, $0.height)) } ?? 1
+            let textTexture = activeText.flatMap(cachedTextTexture(for:)) ?? sourceTexture
+            let textAspect = Float(4)
             var uniforms = Uniforms(
                 backgroundStart: colors.0,
                 backgroundEnd: colors.1,
@@ -290,6 +300,18 @@ final class MetalProjectRenderer: @unchecked Sendable {
                     activeBranding?.contentMode == .fill ? 1 : 0,
                     brandingAspect,
                     Float(activeBranding?.cornerRadius ?? 0)
+                ),
+                textRect: activeText.map {
+                    let width = min(max($0.normalizedWidth, 0.05), 1)
+                    let height = width * outputSize.width / max(outputSize.height, 1) / Double(textAspect)
+                    return SIMD4(
+                        Float($0.normalizedX - width / 2), Float($0.normalizedY - height / 2),
+                        Float(width), Float(height)
+                    )
+                } ?? .zero,
+                text: SIMD4(
+                    activeText == nil ? 0 : Float(min(max(activeText?.opacity ?? 0, 0), 1)),
+                    0, 0, 0
                 )
             )
             var overlays = activeOverlays(at: timelineTime, instruction: instruction)
@@ -310,6 +332,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             encoder.setFragmentTexture(sourceTexture, index: 0)
             encoder.setFragmentTexture(cameraTexture, index: 1)
             encoder.setFragmentTexture(brandingTexture, index: 2)
+            encoder.setFragmentTexture(textTexture, index: 3)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
             encoder.setFragmentBytes(&overlays, length: MemoryLayout<GPUOverlay>.stride * overlays.count, index: 1)
             encoder.setFragmentBytes(&overlayCount, length: MemoryLayout<UInt32>.stride, index: 2)
@@ -342,6 +365,89 @@ final class MetalProjectRenderer: @unchecked Sendable {
               ) else { return nil }
         brandingTextureCache[id] = texture
         return texture
+    }
+
+    private func cachedTextTexture(for item: TextOverlay) -> MTLTexture? {
+        if let cached = textTextureCache[item] { return cached }
+        guard let image = makeTextImage(item),
+              let texture = try? textureLoader.newTexture(
+                cgImage: image,
+                options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
+              ) else { return nil }
+        textTextureCache[item] = texture
+        if textTextureCache.count > 96 { textTextureCache.removeAll(keepingCapacity: true) }
+        return texture
+    }
+
+    private func makeTextImage(_ item: TextOverlay) -> CGImage? {
+        let width = 1600
+        let height = 400
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.setFillColor(cgColor(item.backgroundHex, alpha: item.backgroundOpacity))
+        context.addPath(CGPath(roundedRect: CGRect(x: 12, y: 12, width: width - 24, height: height - 24), cornerWidth: 34, cornerHeight: 34, transform: nil))
+        context.fillPath()
+
+        let fontName: CFString = switch item.weight {
+        case .regular: "SFProDisplay-Regular" as CFString
+        case .medium: "SFProDisplay-Medium" as CFString
+        case .semibold: "SFProDisplay-Semibold" as CFString
+        case .bold: "SFProDisplay-Bold" as CFString
+        }
+        let font = CTFontCreateWithName(fontName, CGFloat(min(max(item.fontSize, 18), 144)), nil)
+        var alignment: CTTextAlignment = switch item.alignment {
+        case .left: .left
+        case .center: .center
+        case .right: .right
+        }
+        var lineBreak = CTLineBreakMode.byWordWrapping
+        let paragraph = withUnsafePointer(to: &alignment) { alignmentPointer in
+            withUnsafePointer(to: &lineBreak) { lineBreakPointer in
+                let settings = [
+                    CTParagraphStyleSetting(
+                        spec: .alignment,
+                        valueSize: MemoryLayout<CTTextAlignment>.size,
+                        value: alignmentPointer
+                    ),
+                    CTParagraphStyleSetting(
+                        spec: .lineBreakMode,
+                        valueSize: MemoryLayout<CTLineBreakMode>.size,
+                        value: lineBreakPointer
+                    )
+                ]
+                return CTParagraphStyleCreate(settings, settings.count)
+            }
+        }
+        let attributed = NSAttributedString(
+            string: item.text,
+            attributes: [
+                kCTFontAttributeName as NSAttributedString.Key: font,
+                kCTForegroundColorAttributeName as NSAttributedString.Key: cgColor(item.foregroundHex, alpha: 1),
+                kCTParagraphStyleAttributeName as NSAttributedString.Key: paragraph
+            ]
+        )
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed)
+        context.saveGState()
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        let path = CGPath(rect: CGRect(x: 72, y: 48, width: width - 144, height: height - 96), transform: nil)
+        CTFrameDraw(CTFramesetterCreateFrame(framesetter, CFRange(), path, nil), context)
+        context.restoreGState()
+        return context.makeImage()
+    }
+
+    private func cgColor(_ hex: String, alpha: Double) -> CGColor {
+        let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        let value = UInt64(cleaned, radix: 16) ?? 0xFFFFFF
+        return CGColor(
+            red: CGFloat((value >> 16) & 255) / 255,
+            green: CGFloat((value >> 8) & 255) / 255,
+            blue: CGFloat(value & 255) / 255,
+            alpha: CGFloat(min(max(alpha, 0), 1))
+        )
     }
 
     private func transitionCode(_ kind: ClipTransitionKind?) -> Float {
@@ -417,6 +523,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         float4 cameraFocus; float4 cursor; float4 chrome; float4 output;
         float4 transition; float4 videoRect; float4 video;
         float4 brandingRect; float4 branding;
+        float4 textRect; float4 text;
     };
     struct Overlay { float4 rect; float4 values; };
 
@@ -457,6 +564,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
         texture2d<float> screen [[texture(0)]],
         texture2d<float> camera [[texture(1)]],
         texture2d<float> brandingTexture [[texture(2)]],
+        texture2d<float> textTexture [[texture(3)]],
         constant Uniforms &u [[buffer(0)]],
         constant Overlay *overlays [[buffer(1)]],
         constant uint &overlayCount [[buffer(2)]]) {
@@ -572,6 +680,11 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 float brandMask = roundedMask(uv, u.brandingRect, radius);
                 color = mix(color, brandColor, brandColor.a * u.branding.x * brandMask);
             }
+        }
+        if (u.text.x > 0.001 && inside(uv, u.textRect)) {
+            float2 textUV = (uv - u.textRect.xy) / u.textRect.zw;
+            float4 textColor = textTexture.sample(s, textUV);
+            color = mix(color, textColor, textColor.a * u.text.x);
         }
         return color;
     }

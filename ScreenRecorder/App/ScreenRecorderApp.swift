@@ -21,12 +21,12 @@ struct CapturaApp: App {
         }
 
         Window("captura Recording", id: "recording-controller") {
-            RecordingController()
+            RecordingController(isFloating: true)
                 .environmentObject(model)
                 .background(FloatingWindowAccessor())
         }
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
+        .defaultSize(width: 680, height: 450)
         .defaultPosition(.topTrailing)
 
         Window("Project Preview", id: "project-preview") {

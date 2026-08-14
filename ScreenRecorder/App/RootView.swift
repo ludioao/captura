@@ -58,9 +58,10 @@ private struct HomeView: View {
 
             if model.recordingState == .recording || model.recordingState == .paused || model.recordingState == .stopping {
                 RecordingController()
-                    .frame(maxWidth: 520)
+                    .frame(minWidth: 600, idealWidth: 960, maxWidth: 1_200, maxHeight: .infinity)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(32)
+                    .padding(.horizontal, 40)
+                    .padding(.vertical, 28)
             } else {
                 HSplitView {
                     sourcePreviewCard
@@ -625,6 +626,7 @@ private struct RecentProjectRow: View {
 
 struct RecordingController: View {
     @EnvironmentObject private var model: AppModel
+    var isFloating = false
 
     var body: some View {
         VStack(spacing: 14) {
@@ -649,36 +651,49 @@ struct RecordingController: View {
                     .disabled(model.recordingState == .stopping)
             }
         }
-        .padding(14)
+        .padding(isFloating ? 16 : 18)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var recordingPreview: some View {
-        ZStack(alignment: .bottomTrailing) {
-            Color.black
-            if let preview = model.liveScreenPreview ?? model.sourcePreview {
-                Image(nsImage: preview)
-                    .resizable()
-                    .scaledToFit()
-            } else {
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(.white)
-            }
+        GeometryReader { proxy in
+            let cameraWidth = min(max(proxy.size.width * 0.22, 120), 280)
+            ZStack(alignment: .bottomTrailing) {
+                Color.black
+                if let preview = model.liveScreenPreview ?? model.sourcePreview {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(.white)
+                }
 
-            if model.captureWebcam {
-                CameraPreviewView(session: model.webcamPreviewSession)
-                    .frame(width: 112, height: 70)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(.white.opacity(0.75), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(0.42), radius: 8, y: 4)
-                    .padding(10)
+                if model.captureWebcam {
+                    CameraPreviewView(session: model.webcamPreviewSession)
+                        .frame(width: cameraWidth, height: cameraWidth * 0.625)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(.white.opacity(0.75), lineWidth: 1)
+                        }
+                        .shadow(color: .black.opacity(0.42), radius: 10, y: 5)
+                        .padding(min(max(proxy.size.width * 0.018, 10), 20))
+                }
             }
         }
-        .frame(width: 360, height: 203)
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .frame(
+            minWidth: isFloating ? 500 : nil,
+            idealWidth: isFloating ? 640 : 960,
+            maxWidth: isFloating ? 820 : .infinity,
+            minHeight: isFloating ? 281 : nil,
+            idealHeight: isFloating ? 360 : 540,
+            maxHeight: .infinity
+        )
+        .layoutPriority(1)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(alignment: .topLeading) {
             Label("LIVE", systemImage: "circle.fill")

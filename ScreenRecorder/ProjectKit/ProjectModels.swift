@@ -222,6 +222,7 @@ enum TimelineTrackKind: String, Codable, CaseIterable, Hashable, Sendable {
 struct TimelineTrack: Codable, Identifiable, Hashable, Sendable {
     static let primaryVideoID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
     static let defaultOverlayID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
+    static let defaultTextID = UUID(uuidString: "00000000-0000-0000-0000-000000000103")!
 
     var id: UUID
     var name: String
@@ -231,6 +232,33 @@ struct TimelineTrack: Codable, Identifiable, Hashable, Sendable {
 
     static let primaryVideo = TimelineTrack(id: primaryVideoID, name: "Screen", kind: .video)
     static let defaultOverlay = TimelineTrack(id: defaultOverlayID, name: "Branding", kind: .overlay)
+    static let defaultText = TimelineTrack(id: defaultTextID, name: "Text", kind: .overlay)
+}
+
+enum TextOverlayAlignment: String, Codable, CaseIterable, Hashable, Sendable {
+    case left, center, right
+}
+
+enum TextOverlayWeight: String, Codable, CaseIterable, Hashable, Sendable {
+    case regular, medium, semibold, bold
+}
+
+struct TextOverlay: Codable, Identifiable, Hashable, Sendable {
+    var id = UUID()
+    var text: String
+    var startTime: Double
+    var endTime: Double
+    var normalizedX: Double = 0.5
+    var normalizedY: Double = 0.5
+    var normalizedWidth: Double = 0.7
+    var fontSize: Double = 64
+    var weight: TextOverlayWeight = .semibold
+    var alignment: TextOverlayAlignment = .center
+    var foregroundHex = "#FFFFFF"
+    var backgroundHex = "#111318"
+    var backgroundOpacity: Double = 0
+    var opacity: Double = 1
+    var trackID: UUID? = nil
 }
 
 struct BrandingOverlay: Codable, Identifiable, Hashable, Sendable {
@@ -359,6 +387,7 @@ struct ScreenProject: Codable, Identifiable, Hashable, Sendable {
     var overlays: [OverlayRegion]? = nil
     var webcamKeyframes: [WebcamLayoutKeyframe]? = nil
     var brandingOverlays: [BrandingOverlay]? = nil
+    var textOverlays: [TextOverlay]? = nil
     var timelineTracks: [TimelineTrack]? = nil
     var videoAssets: [ProjectVideoAsset]? = nil
 }

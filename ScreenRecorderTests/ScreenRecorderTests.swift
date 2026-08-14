@@ -342,6 +342,28 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(decoded.timeline.clips[0].layout, project.timeline.clips[0].layout)
     }
 
+    func testVideoTemplateGeneratorProducesPlayableMovie() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "captura-template-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let template = try XCTUnwrap(VideoTemplateDescriptor.library.first { $0.id == "chapter" })
+
+        try await VideoTemplateGenerator.generate(
+            template: template,
+            title: "Chapter One",
+            subtitle: "A generated scene",
+            canvas: CanvasSize(width: 320, height: 180),
+            outputURL: url,
+            frameRate: 10
+        )
+
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let duration = try await asset.load(.duration).seconds
+        XCTAssertEqual(tracks.count, 1)
+        XCTAssertEqual(duration, template.duration, accuracy: 0.12)
+    }
+
     func testRecordingResolutionPreservesNonWidescreenAspect() {
         let output = RecordingResolution.fullHD.dimensions(nativeWidth: 1000, nativeHeight: 1000)
         XCTAssertEqual(output.width, 1080)
@@ -568,6 +590,51 @@ final class ScreenRecorderTests: XCTestCase {
         let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
         XCTAssertGreaterThan(bytes[center + 2], 220)
         XCTAssertLessThan(bytes[center], 20)
+    }
+
+    func testMetalProjectRendererCompositesTimedText() throws {
+        let source = try makeMetalPixelBuffer(width: 96, height: 54, value: 0x22)
+        let destination = try makeMetalPixelBuffer(width: 192, height: 108, value: 0)
+        var project = sampleProject(duration: 1)
+        project.settings.canvas = CanvasSize(width: 96, height: 54)
+        project.settings.appearance = .default
+        project.textOverlays = [TextOverlay(
+            text: "Title",
+            startTime: 0,
+            endTime: 1,
+            normalizedWidth: 0.6,
+            backgroundHex: "#FF0000",
+            backgroundOpacity: 1,
+            trackID: TimelineTrack.defaultTextID
+        )]
+        let geometry = ExportGeometry(
+            outputSize: CGSize(width: 192, height: 108),
+            sourceSize: project.settings.canvas,
+            appearance: .default
+        )
+        let instruction = CapturaVideoInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: CMTime(seconds: 1, preferredTimescale: 600)),
+            screenTrackID: 1,
+            cameraTrackID: nil,
+            project: project,
+            events: [],
+            geometry: geometry
+        )
+
+        try MetalProjectRenderer().render(
+            source: source,
+            camera: nil,
+            destination: destination,
+            compositionTime: CMTime(seconds: 0.5, preferredTimescale: 600),
+            instruction: instruction
+        )
+
+        CVPixelBufferLockBaseAddress(destination, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+        let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(destination)).assumingMemoryBound(to: UInt8.self)
+        let center = CVPixelBufferGetBytesPerRow(destination) * 54 + 96 * 4
+        XCTAssertGreaterThan(bytes[center + 2], 220)
+        XCTAssertLessThan(bytes[center], 40)
     }
 
     func testMutedOverlayTrackIsNotRenderedByMetalCompositor() throws {
@@ -798,6 +865,30 @@ final class ScreenRecorderTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ScreenProject.self, from: data)
         XCTAssertEqual(decoded.brandingOverlays, project.brandingOverlays)
         XCTAssertEqual(decoded.timelineTracks, project.timelineTracks)
+    }
+
+    func testTextOverlayPersistsWithProject() throws {
+        var project = sampleProject(duration: 8)
+        project.textOverlays = [TextOverlay(
+            text: "Launch day",
+            startTime: 1.5,
+            endTime: 4.5,
+            normalizedX: 0.5,
+            normalizedY: 0.8,
+            normalizedWidth: 0.72,
+            fontSize: 72,
+            weight: .bold,
+            alignment: .center,
+            foregroundHex: "#FFFFFF",
+            backgroundHex: "#111318",
+            backgroundOpacity: 0.75,
+            trackID: TimelineTrack.defaultTextID
+        )]
+
+        let data = try JSONEncoder().encode(project)
+        let decoded = try JSONDecoder().decode(ScreenProject.self, from: data)
+
+        XCTAssertEqual(decoded.textOverlays, project.textOverlays)
     }
 
     func testNearbyClicksAreGroupedIntoOneIntent() {

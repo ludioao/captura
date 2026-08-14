@@ -154,6 +154,9 @@ private final class ProjectEditHistory: ObservableObject {
         if new.timeline.clips.count < old.timeline.clips.count { return "Delete Clip" }
         if new.timeline != old.timeline { return "Edit Clip" }
         if new.timelineTracks != old.timelineTracks { return "Edit Track" }
+        if (new.textOverlays?.count ?? 0) > (old.textOverlays?.count ?? 0) { return "Add Text" }
+        if (new.textOverlays?.count ?? 0) < (old.textOverlays?.count ?? 0) { return "Delete Text" }
+        if new.textOverlays != old.textOverlays { return "Edit Text" }
         if new.brandingOverlays != old.brandingOverlays { return "Edit Overlay" }
         return "Edit Project"
     }
@@ -219,11 +222,14 @@ struct EditorView: View {
     @State private var project: ScreenProject
     @State private var selectedClipID: UUID?
     @State private var selectedBrandingID: UUID?
+    @State private var selectedTextID: UUID?
     @State private var selectedTrackID: UUID? = TimelineTrack.primaryVideoID
     @State private var hasUnsavedChanges = false
     @State private var showsEvents = false
     @State private var showsCanvasInspector = true
     @State private var showsExportSettings = false
+    @State private var showsVideoLibrary = false
+    @State private var templateInsertionTime = 0.0
     @State private var inspectorSection = EditorInspectorSection.canvas
     @State private var waveform: [Double] = []
     @State private var showsCaptionEntry = false
@@ -272,7 +278,7 @@ struct EditorView: View {
 
                 if showsCanvasInspector {
                     Divider()
-                    editorInspector.frame(width: 270)
+                    editorInspector.frame(width: 336)
                 }
             }
             Divider()
@@ -280,6 +286,7 @@ struct EditorView: View {
             ProfessionalTimelineView(
                 timeline: $project.timeline,
                 brandingOverlays: brandingOverlaysBinding,
+                textOverlays: textOverlaysBinding,
                 customTracks: timelineTracksBinding,
                 cameraKeyframes: project.cameraKeyframes,
                 webcamKeyframes: project.webcamKeyframes ?? [],
@@ -290,9 +297,12 @@ struct EditorView: View {
                 playhead: playback.currentTime,
                 selectedClipID: $selectedClipID,
                 selectedBrandingID: $selectedBrandingID,
+                selectedTextID: $selectedTextID,
                 selectedTrackID: $selectedTrackID,
                 seek: playback.seek,
                 importVideos: { urls, time in importVideos(urls, at: time) },
+                showVideoLibrary: showVideoLibrary,
+                addText: addTextOverlay,
                 changed: timelineDidChange
             )
             .frame(height: 300)
@@ -308,6 +318,9 @@ struct EditorView: View {
                 sourceCanvas: project.settings.canvas,
                 export: startExport
             )
+        }
+        .sheet(isPresented: $showsVideoLibrary) {
+            VideoTemplateLibraryView(canvas: project.settings.canvas, insert: insertVideoTemplate)
         }
         .overlay(alignment: .topTrailing) { exportStatus }
         .alert("Export failed", isPresented: Binding(
@@ -370,6 +383,12 @@ struct EditorView: View {
         .onChange(of: project.settings.audio, initial: true) { _, value in
             playback.updateAudio(value ?? .default)
         }
+        .onChange(of: selectedTextID) { _, value in
+            if value != nil { inspectorSection = .text }
+        }
+        .onChange(of: selectedClipID) { _, value in
+            if value != nil { inspectorSection = .media }
+        }
         .onChange(of: project) { old, value in
             if isApplyingHistory { isApplyingHistory = false }
             else { editHistory.record(old: old, new: value) }
@@ -425,42 +444,15 @@ struct EditorView: View {
             Button {
                 withAnimation(.easeOut(duration: 0.18)) { showsCanvasInspector.toggle() }
             } label: {
-                Label("Canvas", systemImage: "paintpalette")
+                Label("Inspector", systemImage: "sidebar.right")
             }
             .buttonStyle(.bordered)
             .tint(showsCanvasInspector ? .accentColor : .secondary)
             Button {
                 openWindow(id: "project-preview")
             } label: {
-                Label("Floating Preview", systemImage: "pip")
+                Label("Preview", systemImage: "pip")
             }
-            Button("Split") { splitSelectedClip() }
-                .disabled(selectedClipID == nil)
-                .keyboardShortcut("b", modifiers: .command)
-            Menu("Zoom") {
-                Button("Add zoom at playhead") { addManualZoom() }
-                Button("Remove nearby zoom") { removeNearbyZoom() }
-                    .disabled(project.cameraKeyframes.isEmpty)
-                Divider()
-                Button("Regenerate from clicks & typing…") {
-                    showsRegenerateZoomConfirmation = true
-                }
-                .disabled(openProject.events.allSatisfy { $0.type != .click && $0.type != .keyActivity })
-            }
-            Button("Trim Start") { trimStart() }
-                .disabled(selectedClipID == nil)
-            Button("Trim End") { trimEnd() }
-                .disabled(selectedClipID == nil)
-            Menu("Speed") {
-                ForEach([0.5, 1, 1.5, 2, 3, 4], id: \.self) { speed in
-                    Button(speed == 1 ? "1× (Normal)" : "\(speed.formatted())×") { setSpeed(speed) }
-                }
-            }
-            .disabled(selectedClipID == nil)
-            Button(role: .destructive) { deleteSelectedClip() } label: {
-                Image(systemName: "trash")
-            }
-            .disabled(selectedClipID == nil)
             Button("Save") {
                 Task {
                     if await save(project) { hasUnsavedChanges = false }
@@ -525,9 +517,7 @@ struct EditorView: View {
             Text("·")
             Text("\(openProject.project.cameraKeyframes.filter { $0.scale > 1 }.count) zoom regions")
             Spacer()
-            Text(openProject.packageURL.path)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            Text(hasUnsavedChanges ? "Saving changes…" : "All changes saved")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -577,6 +567,13 @@ struct EditorView: View {
         )
     }
 
+    private var textOverlaysBinding: Binding<[TextOverlay]> {
+        Binding(
+            get: { project.textOverlays ?? [] },
+            set: { project.textOverlays = $0; hasUnsavedChanges = true }
+        )
+    }
+
     private var timelineTracksBinding: Binding<[TimelineTrack]> {
         Binding(
             get: { project.timelineTracks ?? [] },
@@ -618,16 +615,38 @@ struct EditorView: View {
 
     @ViewBuilder
     private var editorInspector: some View {
-        VStack(spacing: 0) {
-            Picker("Inspector", selection: $inspectorSection) {
+        HStack(spacing: 0) {
+            VStack(spacing: 5) {
                 ForEach(EditorInspectorSection.allCases) { section in
-                    Image(systemName: section.icon).tag(section)
+                    Button {
+                        inspectorSection = section
+                    } label: {
+                        Image(systemName: section.icon)
+                            .font(.system(size: 15, weight: .medium))
+                            .frame(width: 32, height: 30)
+                            .background(inspectorSection == section ? Color.accentColor.opacity(0.16) : .clear)
+                            .foregroundStyle(inspectorSection == section ? Color.accentColor : .secondary)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .help(section.title)
                 }
+                Spacer()
             }
-            .pickerStyle(.segmented)
-            .padding(12)
+            .padding(.vertical, 10)
+            .frame(width: 48)
+            .background(Color(nsColor: .controlBackgroundColor))
             Divider()
-            switch inspectorSection {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Image(systemName: inspectorSection.icon).foregroundStyle(Color.accentColor)
+                    Text(inspectorSection.title).font(.headline)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 44)
+                Divider()
+                switch inspectorSection {
             case .media:
                 MediaInspector(
                     timeline: $project.timeline,
@@ -645,6 +664,14 @@ struct EditorView: View {
                     audio: audioBinding,
                     cursor: cursorBinding,
                     hasCamera: playback.cameraPlayer != nil
+                )
+            case .text:
+                TextOverlayInspector(
+                    overlays: textOverlaysBinding,
+                    selectedID: $selectedTextID,
+                    playhead: playback.currentTime,
+                    duration: project.duration,
+                    add: addTextOverlay
                 )
             case .audio:
                 AudioInspector(settings: audioBinding)
@@ -679,9 +706,27 @@ struct EditorView: View {
                     overlays: overlaysBinding,
                     add: addOverlay
                 )
+                }
             }
         }
         .background(Color(nsColor: .underPageBackgroundColor))
+    }
+
+    private func addTextOverlay() {
+        let start = min(max(playback.currentTime, 0), max(project.duration - 0.05, 0))
+        let item = TextOverlay(
+            text: "Your text",
+            startTime: start,
+            endTime: min(project.duration, start + 3),
+            trackID: TimelineTrack.defaultTextID
+        )
+        project.textOverlays = (project.textOverlays ?? []) + [item]
+        selectedTextID = item.id
+        selectedClipID = nil
+        selectedBrandingID = nil
+        selectedTrackID = TimelineTrack.defaultTextID
+        inspectorSection = .text
+        hasUnsavedChanges = true
     }
 
     private func addCaption() {
@@ -914,6 +959,7 @@ struct EditorView: View {
         project = snapshot
         if !project.timeline.clips.contains(where: { $0.id == selectedClipID }) { selectedClipID = nil }
         if !(project.brandingOverlays ?? []).contains(where: { $0.id == selectedBrandingID }) { selectedBrandingID = nil }
+        if !(project.textOverlays ?? []).contains(where: { $0.id == selectedTextID }) { selectedTextID = nil }
         playback.seek(to: min(playback.currentTime, project.duration))
     }
 
@@ -978,6 +1024,47 @@ struct EditorView: View {
                 mediaImportError = error.localizedDescription
             }
         }
+    }
+
+    private func showVideoLibrary(at time: Double) {
+        templateInsertionTime = min(max(time, 0), project.timeline.duration)
+        showsVideoLibrary = true
+    }
+
+    private func insertVideoTemplate(
+        _ template: VideoTemplateDescriptor,
+        title: String,
+        subtitle: String
+    ) async throws {
+        let assetID = UUID()
+        let directory = openProject.packageURL.appending(path: "assets/video", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let relativePath = "assets/video/\(assetID.uuidString).mov"
+        let destination = openProject.packageURL.appending(path: relativePath)
+        try await VideoTemplateGenerator.generate(
+            template: template,
+            title: title,
+            subtitle: subtitle,
+            canvas: project.settings.canvas,
+            outputURL: destination,
+            frameRate: min(max(project.settings.frameRate, 24), 60)
+        )
+        let media = ProjectVideoAsset(
+            id: assetID,
+            path: relativePath,
+            name: template.name,
+            duration: template.duration,
+            width: project.settings.canvas.width,
+            height: project.settings.canvas.height
+        )
+        project.videoAssets = (project.videoAssets ?? []) + [media]
+        let clip = TimelineClip(
+            id: UUID(), sourceMediaID: assetID, sourceStart: 0, sourceEnd: template.duration,
+            timelineStart: templateInsertionTime, speed: 1, transitionOut: .init(kind: .fade), layout: .default
+        )
+        project.timeline.insert(clip, at: templateInsertionTime)
+        selectedClipID = clip.id
+        timelineDidChange()
     }
 
     private func seekToSourceTime(_ sourceTime: Double) {
@@ -1147,12 +1234,14 @@ private enum ExportPreset: String, CaseIterable, Identifiable {
 }
 
 private enum EditorInspectorSection: String, CaseIterable, Identifiable {
-    case media, canvas, audio, cursor, zoom, webcam, captions, overlays
+    case media, canvas, text, audio, cursor, zoom, webcam, captions, overlays
     var id: String { rawValue }
+    var title: String { rawValue.capitalized }
     var icon: String {
         switch self {
         case .media: "film.stack"
         case .canvas: "paintpalette"
+        case .text: "textformat"
         case .audio: "waveform"
         case .cursor: "cursorarrow.motionlines"
         case .zoom: "viewfinder"
@@ -1160,6 +1249,106 @@ private enum EditorInspectorSection: String, CaseIterable, Identifiable {
         case .captions: "captions.bubble"
         case .overlays: "rectangle.dashed"
         }
+    }
+}
+
+private struct TextOverlayInspector: View {
+    @Binding var overlays: [TextOverlay]
+    @Binding var selectedID: UUID?
+    let playhead: Double
+    let duration: Double
+    let add: () -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                Button("Add Text", systemImage: "text.badge.plus", action: add)
+                    .buttonStyle(.borderedProminent)
+                Text("Text is a timed clip: drag or trim it directly in the timeline.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let binding = selectedBinding {
+                Section("Content") {
+                    TextField("Text", text: binding.text, axis: .vertical)
+                        .lineLimit(2...5)
+                    HStack {
+                        TextField("Start", value: binding.startTime, format: .number.precision(.fractionLength(1)))
+                        TextField("End", value: binding.endTime, format: .number.precision(.fractionLength(1)))
+                    }
+                }
+                Section("Typography") {
+                    Picker("Weight", selection: binding.weight) {
+                        ForEach(TextOverlayWeight.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                    }
+                    Picker("Alignment", selection: binding.alignment) {
+                        Label("Left", systemImage: "text.alignleft").tag(TextOverlayAlignment.left)
+                        Label("Center", systemImage: "text.aligncenter").tag(TextOverlayAlignment.center)
+                        Label("Right", systemImage: "text.alignright").tag(TextOverlayAlignment.right)
+                    }
+                    .pickerStyle(.segmented)
+                    LabeledContent("Size", value: "\(Int(binding.fontSize.wrappedValue)) pt")
+                    Slider(value: binding.fontSize, in: 18...144)
+                    TextField("Text color", text: binding.foregroundHex)
+                    TextField("Background", text: binding.backgroundHex)
+                    LabeledContent("Background", value: binding.backgroundOpacity.wrappedValue, format: .percent)
+                    Slider(value: binding.backgroundOpacity, in: 0...1)
+                }
+                Section("Layout") {
+                    LabeledContent("Position X", value: binding.normalizedX.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedX, in: 0...1)
+                    LabeledContent("Position Y", value: binding.normalizedY.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedY, in: 0...1)
+                    LabeledContent("Width", value: binding.normalizedWidth.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedWidth, in: 0.15...1)
+                    LabeledContent("Opacity", value: binding.opacity.wrappedValue, format: .percent)
+                    Slider(value: binding.opacity, in: 0...1)
+                    Button("Lower Third") {
+                        binding.normalizedX.wrappedValue = 0.5
+                        binding.normalizedY.wrappedValue = 0.82
+                        binding.normalizedWidth.wrappedValue = 0.72
+                        binding.backgroundOpacity.wrappedValue = 0.72
+                    }
+                    Button("Centered Title") {
+                        binding.normalizedX.wrappedValue = 0.5
+                        binding.normalizedY.wrappedValue = 0.5
+                        binding.normalizedWidth.wrappedValue = 0.76
+                        binding.backgroundOpacity.wrappedValue = 0
+                    }
+                }
+                Section {
+                    Button("Delete Text", systemImage: "trash", role: .destructive) {
+                        overlays.removeAll { $0.id == selectedID }
+                        selectedID = nil
+                    }
+                }
+            } else {
+                ContentUnavailableView(
+                    "Select a text clip",
+                    systemImage: "textformat",
+                    description: Text("Choose text in the timeline or add it at \(format(playhead)).")
+                )
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var selectedBinding: Binding<TextOverlay>? {
+        guard let selectedID, overlays.contains(where: { $0.id == selectedID }) else { return nil }
+        return Binding(
+            get: { overlays.first(where: { $0.id == selectedID })! },
+            set: { value in
+                guard let index = overlays.firstIndex(where: { $0.id == selectedID }) else { return }
+                var adjusted = value
+                adjusted.startTime = min(max(adjusted.startTime, 0), max(duration - 0.05, 0))
+                adjusted.endTime = min(max(adjusted.endTime, adjusted.startTime + 0.05), duration)
+                overlays[index] = adjusted
+            }
+        )
+    }
+
+    private func format(_ seconds: Double) -> String {
+        String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
     }
 }
 
@@ -1671,7 +1860,7 @@ private struct CaptionInspector: View {
 }
 
 private enum EditorTimelineLaneRole: Equatable {
-    case video, overlay, zoom, webcam, interactions, audio
+    case video, text, overlay, zoom, webcam, interactions, audio
 }
 
 private struct EditorTimelineLane: Identifiable {
@@ -1684,6 +1873,7 @@ private struct EditorTimelineLane: Identifiable {
 private struct ProfessionalTimelineView: View {
     @Binding var timeline: Timeline
     @Binding var brandingOverlays: [BrandingOverlay]
+    @Binding var textOverlays: [TextOverlay]
     @Binding var customTracks: [TimelineTrack]
     let cameraKeyframes: [CameraKeyframe]
     let webcamKeyframes: [WebcamLayoutKeyframe]
@@ -1694,9 +1884,12 @@ private struct ProfessionalTimelineView: View {
     let playhead: Double
     @Binding var selectedClipID: UUID?
     @Binding var selectedBrandingID: UUID?
+    @Binding var selectedTextID: UUID?
     @Binding var selectedTrackID: UUID?
     let seek: (Double) -> Void
     let importVideos: ([URL], Double) -> Void
+    let showVideoLibrary: (Double) -> Void
+    let addText: () -> Void
     let changed: () -> Void
 
     @State private var pixelsPerSecond = 86.0
@@ -1724,6 +1917,11 @@ private struct ProfessionalTimelineView: View {
                     }
                     .scrollIndicators(.visible)
                 }
+                .background {
+                    TimelineScrollZoomMonitor { delta, isPrecise in
+                        zoomTimeline(by: delta, isPrecise: isPrecise)
+                    }
+                }
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
@@ -1738,16 +1936,14 @@ private struct ProfessionalTimelineView: View {
         HStack(spacing: 10) {
             Menu {
                 Button("Overlay Track", systemImage: "rectangle.stack.badge.plus", action: addOverlayTrack)
+                Divider()
+                Button("Text", systemImage: "text.badge.plus", action: addText)
+                Button("Import Video…", systemImage: "film.badge.plus") { importVideos([], playhead) }
+                Button("Video Template", systemImage: "play.square.stack") { showVideoLibrary(playhead) }
             } label: {
-                Label("Add Track", systemImage: "plus")
+                Label("Add", systemImage: "plus")
             }
             .menuStyle(.borderlessButton)
-            Button {
-                importVideos([], playhead)
-            } label: {
-                Label("Import Video", systemImage: "film.badge.plus")
-            }
-            .buttonStyle(.borderless)
             Divider().frame(height: 16)
             Button {
                 snappingEnabled.toggle()
@@ -1761,9 +1957,9 @@ private struct ProfessionalTimelineView: View {
                 .font(.caption.monospacedDigit().weight(.medium))
             Image(systemName: "timeline.selection")
                 .foregroundStyle(.secondary)
-            Slider(value: $pixelsPerSecond, in: 40...240)
+            Slider(value: $pixelsPerSecond, in: 40...360)
                 .frame(width: 120)
-                .help("Timeline zoom")
+                .help("Timeline zoom — scroll vertically over the timeline")
             Image(systemName: "plus.magnifyingglass")
                 .foregroundStyle(.secondary)
         }
@@ -1787,7 +1983,7 @@ private struct ProfessionalTimelineView: View {
                     role: lane.role,
                     isSelected: selectedTrackID == lane.id,
                     canRemove: lane.isRemovable,
-                    canRename: lane.role == .video || lane.role == .overlay,
+                    canRename: lane.role == .video || lane.role == .text || lane.role == .overlay,
                     select: { selectedTrackID = lane.id },
                     toggleLock: { updateTrack(lane.track, lock: !lane.track.isLocked) },
                     toggleMute: { updateTrack(lane.track, mute: !lane.track.isMuted) },
@@ -1839,6 +2035,7 @@ private struct ProfessionalTimelineView: View {
                     selectedTrackID = lane.id
                     selectedClipID = nil
                     selectedBrandingID = nil
+                    selectedTextID = nil
                 }
 
             switch lane.role {
@@ -1856,6 +2053,7 @@ private struct ProfessionalTimelineView: View {
                         select: {
                             selectedClipID = clip.id
                             selectedBrandingID = nil
+                            selectedTextID = nil
                             selectedTrackID = lane.id
                         },
                         move: { moveClip(clip.id, by: $0) },
@@ -1869,6 +2067,32 @@ private struct ProfessionalTimelineView: View {
                         duplicate: { duplicateClip(clip.id) },
                         delete: { deleteClip(clip.id) }
                     )
+                }
+            case .text:
+                ForEach($textOverlays) { $item in
+                    if (item.trackID ?? TimelineTrack.defaultTextID) == lane.id {
+                        TimelineTextClip(
+                            item: item,
+                            pixelsPerSecond: pixelsPerSecond,
+                            laneHeight: laneHeight,
+                            playhead: playhead,
+                            isSelected: selectedTextID == item.id,
+                            isLocked: lane.track.isLocked,
+                            select: {
+                                selectedTextID = item.id
+                                selectedClipID = nil
+                                selectedBrandingID = nil
+                                selectedTrackID = lane.id
+                            },
+                            move: { moveText(item.id, by: $0) },
+                            trimStart: { trimTextStart(item.id, to: $0) },
+                            trimEnd: { trimTextEnd(item.id, to: $0) },
+                            split: { splitText(item.id, at: $0) },
+                            duplicate: { duplicateText(item.id) },
+                            delete: { deleteText(item.id) }
+                        )
+                        .opacity(lane.track.isMuted ? 0.35 : 1)
+                    }
                 }
             case .overlay:
                 ForEach($brandingOverlays) { $overlay in
@@ -1884,6 +2108,7 @@ private struct ProfessionalTimelineView: View {
                             select: {
                                 selectedBrandingID = overlay.id
                                 selectedClipID = nil
+                                selectedTextID = nil
                                 selectedTrackID = lane.id
                             },
                             move: { moveOverlay(overlay.id, by: $0) },
@@ -1933,15 +2158,19 @@ private struct ProfessionalTimelineView: View {
 
     private var lanes: [EditorTimelineLane] {
         let video = trackState(fallback: .primaryVideo)
+        let text = trackState(fallback: .defaultText)
         let branding = trackState(fallback: .defaultOverlay)
         let custom = customTracks
             .filter {
                 $0.kind == .overlay &&
-                $0.id != TimelineTrack.primaryVideoID && $0.id != TimelineTrack.defaultOverlayID
+                $0.id != TimelineTrack.primaryVideoID &&
+                $0.id != TimelineTrack.defaultTextID &&
+                $0.id != TimelineTrack.defaultOverlayID
             }
             .map { EditorTimelineLane(track: $0, role: .overlay, isRemovable: true) }
         return [
             EditorTimelineLane(track: video, role: .video, isRemovable: false),
+            EditorTimelineLane(track: text, role: .text, isRemovable: false),
             EditorTimelineLane(track: branding, role: .overlay, isRemovable: false)
         ] + custom + [
             EditorTimelineLane(track: TimelineTrack(id: Self.zoomTrackID, name: "Auto Zoom", kind: .overlay), role: .zoom, isRemovable: false),
@@ -2016,7 +2245,9 @@ private struct ProfessionalTimelineView: View {
     }
 
     private func removeTrack(_ track: TimelineTrack) {
-        guard track.id != TimelineTrack.primaryVideoID, track.id != TimelineTrack.defaultOverlayID else { return }
+        guard track.id != TimelineTrack.primaryVideoID,
+              track.id != TimelineTrack.defaultTextID,
+              track.id != TimelineTrack.defaultOverlayID else { return }
         customTracks.removeAll { $0.id == track.id }
         for index in brandingOverlays.indices where brandingOverlays[index].trackID == track.id {
             brandingOverlays[index].trackID = TimelineTrack.defaultOverlayID
@@ -2040,6 +2271,13 @@ private struct ProfessionalTimelineView: View {
         let clamped = min(max(value, 0), timeline.duration)
         guard snappingEnabled else { return clamped }
         return (clamped * 10).rounded() / 10
+    }
+
+    private func zoomTimeline(by delta: CGFloat, isPrecise: Bool) {
+        guard delta != 0 else { return }
+        let sensitivity = isPrecise ? 0.014 : 0.11
+        let factor = exp(Double(delta) * sensitivity)
+        pixelsPerSecond = min(360, max(40, pixelsPerSecond * factor))
     }
 
     private func moveClip(_ id: UUID, by delta: Double) {
@@ -2134,6 +2372,59 @@ private struct ProfessionalTimelineView: View {
         changed()
     }
 
+    private func moveText(_ id: UUID, by delta: Double) {
+        guard let index = textOverlays.firstIndex(where: { $0.id == id }) else { return }
+        let length = textOverlays[index].endTime - textOverlays[index].startTime
+        let start = min(max(textOverlays[index].startTime + delta, 0), max(0, timeline.duration - length))
+        textOverlays[index].startTime = clampedTime(start)
+        textOverlays[index].endTime = min(timeline.duration, textOverlays[index].startTime + length)
+        changed()
+    }
+
+    private func trimTextStart(_ id: UUID, to time: Double) {
+        guard let index = textOverlays.firstIndex(where: { $0.id == id }) else { return }
+        textOverlays[index].startTime = min(max(time, 0), textOverlays[index].endTime - 0.05)
+        changed()
+    }
+
+    private func trimTextEnd(_ id: UUID, to time: Double) {
+        guard let index = textOverlays.firstIndex(where: { $0.id == id }) else { return }
+        textOverlays[index].endTime = max(textOverlays[index].startTime + 0.05, min(time, timeline.duration))
+        changed()
+    }
+
+    private func splitText(_ id: UUID, at time: Double) {
+        guard let index = textOverlays.firstIndex(where: { $0.id == id }) else { return }
+        let item = textOverlays[index]
+        guard time > item.startTime, time < item.endTime else { return }
+        textOverlays[index].endTime = time
+        var right = item
+        right.id = UUID()
+        right.startTime = time
+        textOverlays.insert(right, at: index + 1)
+        selectedTextID = right.id
+        changed()
+    }
+
+    private func duplicateText(_ id: UUID) {
+        guard let item = textOverlays.first(where: { $0.id == id }) else { return }
+        var copy = item
+        copy.id = UUID()
+        let length = item.endTime - item.startTime
+        copy.startTime = item.endTime + length <= timeline.duration ? item.endTime : max(0, item.startTime - length)
+        copy.endTime = min(timeline.duration, copy.startTime + length)
+        textOverlays.append(copy)
+        selectedTextID = copy.id
+        changed()
+    }
+
+    private func deleteText(_ id: UUID) {
+        guard !trackState(fallback: .defaultText).isLocked else { return }
+        textOverlays.removeAll { $0.id == id }
+        if selectedTextID == id { selectedTextID = nil }
+        changed()
+    }
+
     private func moveOverlay(_ id: UUID, by delta: Double) {
         guard let index = brandingOverlays.firstIndex(where: { $0.id == id }) else { return }
         let length = brandingOverlays[index].endTime - brandingOverlays[index].startTime
@@ -2224,11 +2515,58 @@ private struct ProfessionalTimelineView: View {
 
     private func deleteSelection() {
         if let selectedClipID { deleteClip(selectedClipID) }
+        else if let selectedTextID { deleteText(selectedTextID) }
         else if let selectedBrandingID { deleteOverlay(selectedBrandingID) }
     }
 
     private func formatTime(_ seconds: Double) -> String {
         String(format: "%02d:%02d.%01d", Int(seconds) / 60, Int(seconds) % 60, Int(seconds * 10) % 10)
+    }
+}
+
+@MainActor
+private final class TimelineScrollZoomNSView: NSView {
+    var onZoom: (CGFloat, Bool) -> Void = { _, _ in }
+    private var monitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeMonitor()
+        guard window != nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self, let window = self.window, event.window === window else { return event }
+            let point = self.convert(event.locationInWindow, from: nil)
+            guard self.visibleRect.contains(point),
+                  abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX),
+                  event.scrollingDeltaY != 0 else { return event }
+            self.onZoom(event.scrollingDeltaY, event.hasPreciseScrollingDeltas)
+            return nil
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { removeMonitor() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    private func removeMonitor() {
+        guard let monitor else { return }
+        NSEvent.removeMonitor(monitor)
+        self.monitor = nil
+    }
+}
+
+private struct TimelineScrollZoomMonitor: NSViewRepresentable {
+    let onZoom: (CGFloat, Bool) -> Void
+
+    func makeNSView(context: Context) -> TimelineScrollZoomNSView {
+        let view = TimelineScrollZoomNSView()
+        view.onZoom = onZoom
+        return view
+    }
+
+    func updateNSView(_ nsView: TimelineScrollZoomNSView, context: Context) {
+        nsView.onZoom = onZoom
     }
 }
 
@@ -2257,14 +2595,14 @@ private struct TimelineTrackHeader: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 2)
-            if role == .overlay {
+            if role == .text || role == .overlay {
                 Button(action: toggleMute) {
                     Image(systemName: track.isMuted ? "speaker.slash.fill" : "speaker.wave.2")
                 }
                 .buttonStyle(.borderless)
                 .help(track.isMuted ? "Enable track" : "Mute track")
             }
-            if role == .video || role == .overlay {
+            if role == .video || role == .text || role == .overlay {
                 Button(action: toggleLock) {
                     Image(systemName: track.isLocked ? "lock.fill" : "lock.open")
                 }
@@ -2286,6 +2624,7 @@ private struct TimelineTrackHeader: View {
     private var icon: String {
         switch role {
         case .video: "film"
+        case .text: "textformat"
         case .overlay: "rectangle.on.rectangle"
         case .zoom: "viewfinder"
         case .webcam: "person.crop.rectangle"
@@ -2519,6 +2858,100 @@ private struct TimelineVideoClip: View {
 
     private var speedLabel: String {
         clip.speed == 1 ? "" : "\(clip.speed.formatted())×"
+    }
+}
+
+private struct TimelineTextClip: View {
+    let item: TextOverlay
+    let pixelsPerSecond: Double
+    let laneHeight: Double
+    let playhead: Double
+    let isSelected: Bool
+    let isLocked: Bool
+    let select: () -> Void
+    let move: (Double) -> Void
+    let trimStart: (Double) -> Void
+    let trimEnd: (Double) -> Void
+    let split: (Double) -> Void
+    let duplicate: () -> Void
+    let delete: () -> Void
+
+    @State private var moveOffset = 0.0
+    @State private var startTrimOffset = 0.0
+    @State private var endTrimOffset = 0.0
+    @State private var pointerTime: Double?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.purple : Color.purple.opacity(0.74))
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(.white.opacity(isSelected ? 0.9 : 0.24), lineWidth: isSelected ? 1.5 : 0.5)
+            HStack(spacing: 5) {
+                Image(systemName: "textformat").font(.caption2)
+                Text(item.text.isEmpty ? "Text" : item.text).font(.caption2.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            HStack {
+                trimHandle.highPriorityGesture(trimGesture(isStart: true))
+                Spacer()
+                trimHandle.highPriorityGesture(trimGesture(isStart: false))
+            }
+        }
+        .frame(width: displayedWidth, height: laneHeight - 8)
+        .offset(x: displayedX, y: 4)
+        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .onTapGesture(perform: select)
+        .onContinuousHover { phase in
+            if case let .active(location) = phase {
+                pointerTime = min(item.endTime, max(item.startTime, item.startTime + location.x / pixelsPerSecond))
+            }
+        }
+        .gesture(DragGesture(minimumDistance: 4)
+            .onChanged { if !isLocked { moveOffset = $0.translation.width } }
+            .onEnded {
+                if !isLocked { move($0.translation.width / pixelsPerSecond) }
+                moveOffset = 0
+            }
+        )
+        .contextMenu {
+            Button("Split Here", systemImage: "scissors") { split(editTime) }
+                .disabled(isLocked || editTime <= item.startTime || editTime >= item.endTime)
+            Menu("Trim") {
+                Button("Trim Start Here") { trimStart(editTime) }
+                Button("Trim End Here") { trimEnd(editTime) }
+            }
+            .disabled(isLocked)
+            Divider()
+            Button("Duplicate", systemImage: "plus.square.on.square", action: duplicate).disabled(isLocked)
+            Button("Delete", systemImage: "trash", role: .destructive, action: delete).disabled(isLocked)
+        }
+    }
+
+    private var displayedX: Double { item.startTime * pixelsPerSecond + moveOffset + startTrimOffset }
+    private var displayedWidth: Double {
+        max(24, (item.endTime - item.startTime) * pixelsPerSecond - startTrimOffset + endTrimOffset)
+    }
+    private var editTime: Double { pointerTime ?? playhead }
+    private var trimHandle: some View {
+        RoundedRectangle(cornerRadius: 2).fill(.white.opacity(0.86))
+            .frame(width: 5, height: laneHeight - 16).padding(.horizontal, 3)
+    }
+    private func trimGesture(isStart: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard !isLocked else { return }
+                if isStart { startTrimOffset = value.translation.width }
+                else { endTrimOffset = value.translation.width }
+            }
+            .onEnded { value in
+                guard !isLocked else { return }
+                let delta = value.translation.width / pixelsPerSecond
+                if isStart { trimStart(item.startTime + delta); startTrimOffset = 0 }
+                else { trimEnd(item.endTime + delta); endTrimOffset = 0 }
+            }
     }
 }
 

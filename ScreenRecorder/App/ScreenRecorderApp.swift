@@ -40,6 +40,7 @@ struct CapturaApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        .defaultSize(width: 720, height: 405)
         .defaultPosition(.topTrailing)
     }
 }

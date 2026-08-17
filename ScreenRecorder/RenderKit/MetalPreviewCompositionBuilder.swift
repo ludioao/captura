@@ -7,7 +7,8 @@ enum MetalPreviewCompositionBuilder {
     static func makePlayerItem(
         project: ScreenProject,
         packageURL: URL,
-        events: [InteractionEvent]
+        events: [InteractionEvent],
+        renderState: CapturaVideoRenderState? = nil
     ) async throws -> AVPlayerItem {
         let screenAsset = AVURLAsset(url: packageURL.appending(path: project.media.screen))
         guard let screenSource = try await screenAsset.loadTracks(withMediaType: .video).first else {
@@ -114,6 +115,9 @@ enum MetalPreviewCompositionBuilder {
         let geometry = ExportGeometry(outputSize: size, sourceSize: project.settings.canvas, appearance: appearance)
         let videoComposition = AVMutableVideoComposition()
         videoComposition.customVideoCompositorClass = MetalProjectVideoCompositor.self
+        let brandingImages = renderState == nil
+            ? BrandingAssetLoader.load(project: project, packageURL: packageURL)
+            : [:]
         videoComposition.instructions = [CapturaVideoInstruction(
             timeRange: CMTimeRange(start: .zero, duration: destination),
             screenTrackID: screenTrack.trackID,
@@ -121,12 +125,14 @@ enum MetalPreviewCompositionBuilder {
             project: project,
             events: events,
             geometry: geometry,
-            brandingImages: BrandingAssetLoader.load(project: project, packageURL: packageURL)
+            brandingImages: brandingImages,
+            renderState: renderState
         )]
         videoComposition.renderSize = size
         videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, project.settings.frameRate)))
 
         let item = AVPlayerItem(asset: composition)
+        item.seekingWaitsForVideoCompositionRendering = true
         item.videoComposition = videoComposition
         if !mixParameters.isEmpty {
             let mix = AVMutableAudioMix()

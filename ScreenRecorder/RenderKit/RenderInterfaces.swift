@@ -16,7 +16,15 @@ struct CursorInterpolator: Sendable {
     private let maximumContinuousSampleGap = 0.125
 
     func sample(at time: Double, from samples: [CursorSample]) -> CursorSample? {
-        guard let nextIndex = samples.firstIndex(where: { $0.time >= time }) else { return samples.last }
+        var lowerBound = 0
+        var upperBound = samples.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            if samples[middle].time < time { lowerBound = middle + 1 }
+            else { upperBound = middle }
+        }
+        guard lowerBound < samples.count else { return samples.last }
+        let nextIndex = lowerBound
         guard nextIndex > 0 else { return samples.first }
         let previous = samples[nextIndex - 1]
         let next = samples[nextIndex]

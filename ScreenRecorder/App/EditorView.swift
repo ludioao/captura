@@ -15,6 +15,26 @@ private final class PlayerTimeObserver: @unchecked Sendable {
     deinit { player.removeTimeObserver(token) }
 }
 
+enum PreviewUpdateClassifier {
+    static func requiresRebuild(from old: ScreenProject, to new: ScreenProject) -> Bool {
+        old.timeline != new.timeline ||
+            old.media != new.media ||
+            old.videoAssets != new.videoAssets ||
+            old.audioAssets != new.audioAssets ||
+            old.settings.canvas != new.settings.canvas ||
+            old.settings.frameRate != new.settings.frameRate ||
+            old.settings.audio != new.settings.audio
+    }
+
+    static func brandingAssetsChanged(from old: ScreenProject, to new: ScreenProject) -> Bool {
+        brandingAssetPaths(in: old) != brandingAssetPaths(in: new)
+    }
+
+    private static func brandingAssetPaths(in project: ScreenProject) -> [UUID: String] {
+        Dictionary(uniqueKeysWithValues: (project.brandingOverlays ?? []).map { ($0.id, $0.assetPath) })
+    }
+}
+
 @MainActor
 private final class PlaybackModel: ObservableObject {
     let player: AVPlayer
@@ -23,6 +43,9 @@ private final class PlaybackModel: ObservableObject {
     @Published var usesMetalPreview = false
     private var observation: PlayerTimeObserver?
     private var previewRevision = 0
+    private var renderState: CapturaVideoRenderState?
+    private var latestPreviewProject: ScreenProject?
+    private var frameRefreshTask: Task<Void, Never>?
 
     init(url: URL, cameraURL: URL?) {
         player = AVPlayer(url: url)
@@ -37,7 +60,7 @@ private final class PlaybackModel: ObservableObject {
     func seek(to seconds: Double) {
         SynchronizedPlayback.seek(
             player,
-            cameraPlayer,
+            synchronizedCameraPlayer,
             to: CMTime(seconds: seconds, preferredTimescale: 600)
         )
         currentTime = seconds
@@ -45,26 +68,37 @@ private final class PlaybackModel: ObservableObject {
 
     func togglePlayback() {
         if player.timeControlStatus == .playing {
-            SynchronizedPlayback.pause(player, cameraPlayer)
+            SynchronizedPlayback.pause(player, synchronizedCameraPlayer)
         } else {
-            SynchronizedPlayback.play(player, cameraPlayer)
+            SynchronizedPlayback.play(player, synchronizedCameraPlayer)
         }
     }
 
     func updateMetalPreview(project: ScreenProject, packageURL: URL, events: [InteractionEvent]) async {
         previewRevision += 1
         let revision = previewRevision
-        let time = currentTime
-        let wasPlaying = player.timeControlStatus == .playing
+        latestPreviewProject = project
+        let state = makeRenderState(project: project, packageURL: packageURL, events: events)
         do {
             let item = try await MetalPreviewCompositionBuilder.makePlayerItem(
                 project: project,
                 packageURL: packageURL,
-                events: events
+                events: events,
+                renderState: state
             )
             guard revision == previewRevision else { return }
+            let liveProject = latestPreviewProject ?? project
+            state.update(
+                project: liveProject,
+                geometry: renderGeometry(for: liveProject),
+                brandingImages: BrandingAssetLoader.load(project: liveProject, packageURL: packageURL)
+            )
+            let time = currentTime
+            let wasPlaying = player.timeControlStatus == .playing
+            renderState = state
             player.replaceCurrentItem(with: item)
             usesMetalPreview = true
+            cameraPlayer?.pause()
             await player.seek(
                 to: CMTime(seconds: min(time, project.duration), preferredTimescale: 600),
                 toleranceBefore: .zero,
@@ -76,6 +110,60 @@ private final class PlaybackModel: ObservableObject {
             usesMetalPreview = false
             Log.render.error("Metal preview rebuild failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    func updateLivePreview(
+        project: ScreenProject,
+        packageURL: URL,
+        reloadBrandingImages: Bool = false
+    ) {
+        latestPreviewProject = project
+        guard let renderState else { return }
+        renderState.update(
+            project: project,
+            geometry: renderGeometry(for: project),
+            brandingImages: reloadBrandingImages
+                ? BrandingAssetLoader.load(project: project, packageURL: packageURL)
+                : nil
+        )
+        guard player.timeControlStatus == .paused else { return }
+        frameRefreshTask?.cancel()
+        frameRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled, let self else { return }
+            let time = CMTime(seconds: self.currentTime, preferredTimescale: 600)
+            await self.player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+    }
+
+    func invalidatePendingPreviewBuild() {
+        previewRevision += 1
+    }
+
+    private func makeRenderState(
+        project: ScreenProject,
+        packageURL: URL,
+        events: [InteractionEvent]
+    ) -> CapturaVideoRenderState {
+        CapturaVideoRenderState(
+            project: project,
+            events: events,
+            geometry: renderGeometry(for: project),
+            brandingImages: BrandingAssetLoader.load(project: project, packageURL: packageURL)
+        )
+    }
+
+    private func renderGeometry(for project: ScreenProject) -> ExportGeometry {
+        let size = CGSize(width: project.settings.canvas.width, height: project.settings.canvas.height)
+        return ExportGeometry(
+            outputSize: size,
+            sourceSize: project.settings.canvas,
+            appearance: project.settings.appearance ?? .default
+        )
+    }
+
+    private var synchronizedCameraPlayer: AVPlayer? {
+        usesMetalPreview ? nil : cameraPlayer
     }
 }
 
@@ -217,11 +305,13 @@ struct EditorView: View {
     @State private var showsExportSettings = false
     @State private var showsVideoLibrary = false
     @State private var templateInsertionTime = 0.0
+    @State private var librarySection = EditorLibrarySection.media
     @State private var inspectorSection = EditorInspectorSection.canvas
     @State private var waveform: [Double] = []
     @State private var showsCaptionEntry = false
     @State private var captionDraft = ""
     @State private var autosaveTask: Task<Void, Never>?
+    @State private var previewRebuildTask: Task<Void, Never>?
     @State private var isTranscribing = false
     @State private var transcriptionError: String?
     @State private var brandingImportError: String?
@@ -230,6 +320,8 @@ struct EditorView: View {
     @State private var showsSmartEditConfirmation = false
     @State private var pendingSilentRanges: [ClosedRange<Double>] = []
     @State private var isApplyingHistory = false
+    @State private var timelinePanelHeight = 336.0
+    @State private var timelinePanelDragOrigin: Double?
 
     init(openProject: OpenProject, close: @escaping () -> Void, save: @escaping (ScreenProject) async -> Bool) {
         self.openProject = openProject
@@ -247,7 +339,7 @@ struct EditorView: View {
         VStack(spacing: 0) {
             toolbar
             HStack(spacing: 0) {
-                editorToolRail
+                editorLibrary
                 Divider()
                 CanvasMockupPreview(
                     player: playback.player,
@@ -280,11 +372,30 @@ struct EditorView: View {
 
                 if showsCanvasInspector {
                     Divider()
-                    editorInspector.frame(width: 336)
+                    editorInspector.frame(width: 320)
                 }
             }
             Divider()
             transport
+            TimelinePanelResizeHandle()
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            if timelinePanelDragOrigin == nil { timelinePanelDragOrigin = timelinePanelHeight }
+                            timelinePanelHeight = min(
+                                520,
+                                max(260, (timelinePanelDragOrigin ?? timelinePanelHeight) - value.translation.height)
+                            )
+                        }
+                        .onEnded { _ in timelinePanelDragOrigin = nil }
+                )
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment: timelinePanelHeight = min(520, timelinePanelHeight + 32)
+                    case .decrement: timelinePanelHeight = max(260, timelinePanelHeight - 32)
+                    @unknown default: break
+                    }
+                }
             ProfessionalTimelineView(
                 timeline: $project.timeline,
                 brandingOverlays: brandingOverlaysBinding,
@@ -293,6 +404,7 @@ struct EditorView: View {
                 customTracks: timelineTracksBinding,
                 cameraKeyframes: project.cameraKeyframes,
                 webcamKeyframes: project.webcamKeyframes ?? [],
+                hasCamera: playback.cameraPlayer != nil,
                 events: openProject.events,
                 waveform: waveform,
                 sourceDuration: sourceDuration,
@@ -310,13 +422,14 @@ struct EditorView: View {
                 addText: addTextOverlay,
                 changed: timelineDidChange
             )
-            .frame(height: 300)
+            .frame(height: timelinePanelHeight)
             .padding(.horizontal, 20)
             .padding(.bottom, 8)
             eventSummary
             if showsEvents { eventInspector }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 1_180, minHeight: 760)
         .sheet(isPresented: $showsExportSettings) {
             ExportSettingsView(
                 sourceFPS: project.settings.frameRate,
@@ -395,13 +508,16 @@ struct EditorView: View {
             )
         }
         .onChange(of: selectedTextID) { _, value in
-            if value != nil { inspectorSection = .text }
+            if value != nil { inspectorSection = EditorSelectionKind.text.inspectorSection }
         }
         .onChange(of: selectedClipID) { _, value in
-            if value != nil { inspectorSection = .media }
+            if value != nil { inspectorSection = EditorSelectionKind.video.inspectorSection }
         }
         .onChange(of: selectedAudioID) { _, value in
-            if value != nil { inspectorSection = .audio }
+            if value != nil { inspectorSection = EditorSelectionKind.audio.inspectorSection }
+        }
+        .onChange(of: selectedBrandingID) { _, value in
+            if value != nil { inspectorSection = EditorSelectionKind.branding.inspectorSection }
         }
         .onChange(of: project.brandKit) { _, kit in
             guard let kit else { return }
@@ -413,20 +529,37 @@ struct EditorView: View {
         .onChange(of: project) { old, value in
             if isApplyingHistory { isApplyingHistory = false }
             else { editHistory.record(old: old, new: value) }
+            if PreviewUpdateClassifier.requiresRebuild(from: old, to: value) {
+                playback.invalidatePendingPreviewBuild()
+                previewRebuildTask?.cancel()
+                previewRebuildTask = Task {
+                    try? await Task.sleep(for: .milliseconds(420))
+                    guard !Task.isCancelled else { return }
+                    await playback.updateMetalPreview(
+                        project: value,
+                        packageURL: openProject.packageURL,
+                        events: openProject.events
+                    )
+                }
+            } else {
+                playback.updateLivePreview(
+                    project: value,
+                    packageURL: openProject.packageURL,
+                    reloadBrandingImages: PreviewUpdateClassifier.brandingAssetsChanged(from: old, to: value)
+                )
+            }
             autosaveTask?.cancel()
             hasUnsavedChanges = true
             autosaveTask = Task {
                 try? await Task.sleep(for: .milliseconds(650))
                 guard !Task.isCancelled else { return }
-                await playback.updateMetalPreview(
-                    project: value,
-                    packageURL: openProject.packageURL,
-                    events: openProject.events
-                )
                 if await save(value) { hasUnsavedChanges = false }
             }
         }
-        .onDisappear { autosaveTask?.cancel() }
+        .onDisappear {
+            autosaveTask?.cancel()
+            previewRebuildTask?.cancel()
+        }
     }
 
     private var toolbar: some View {
@@ -437,7 +570,7 @@ struct EditorView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(openProject.packageURL.deletingPathExtension().lastPathComponent)
                     .font(.headline)
-                Text("HEVC · \(openProject.project.settings.frameRate) FPS · \(format(project.duration))")
+                Text(hasUnsavedChanges ? "Saving…" : "Saved · \(format(project.duration))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -462,34 +595,18 @@ struct EditorView: View {
                 Image(systemName: "clock.arrow.circlepath")
             }
             .help("Edit history")
-            Menu {
-                Button("Remove silent pauses", systemImage: "waveform.slash", action: prepareSilentPauseRemoval)
-                    .disabled(waveform.isEmpty)
-                Button("Regenerate click-based zoom", systemImage: "viewfinder") {
-                    showsRegenerateZoomConfirmation = true
-                }
-            } label: {
-                Label("Smart Edit", systemImage: "wand.and.stars")
-            }
             Button {
                 withAnimation(.easeOut(duration: 0.18)) { showsCanvasInspector.toggle() }
             } label: {
-                Label("Inspector", systemImage: "sidebar.right")
+                Image(systemName: "sidebar.right")
             }
-            .buttonStyle(.bordered)
             .tint(showsCanvasInspector ? .accentColor : .secondary)
+            .help(showsCanvasInspector ? "Hide properties" : "Show properties")
             Button {
                 openWindow(id: "project-preview")
             } label: {
                 Label("Preview", systemImage: "pip")
             }
-            Button("Save") {
-                Task {
-                    if await save(project) { hasUnsavedChanges = false }
-                }
-            }
-            .keyboardShortcut("s")
-            .disabled(!hasUnsavedChanges)
             Menu {
                 Button("Quick export with last settings", action: quickExport)
                     .disabled(lastExportSettings == nil)
@@ -500,6 +617,13 @@ struct EditorView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(exportCoordinator.isExporting || project.timeline.clips.isEmpty)
+        }
+        .onKeyPress("s", phases: .down) { keyPress in
+            guard keyPress.modifiers.contains(.command) else { return .ignored }
+            Task {
+                if await save(project) { hasUnsavedChanges = false }
+            }
+            return .handled
         }
         .padding(.horizontal, 18)
         .frame(height: 58)
@@ -687,24 +811,30 @@ struct EditorView: View {
     @ViewBuilder
     private var editorInspector: some View {
         VStack(spacing: 0) {
-                HStack(spacing: 8) {
-                    Image(systemName: inspectorSection.icon).foregroundStyle(inspectorSection.tint)
-                    Text(inspectorSection.title).font(.headline)
-                    Spacer()
-                }
-                .padding(.horizontal, 14)
-                .frame(height: 44)
-                Divider()
-                switch inspectorSection {
+            HStack(spacing: 9) {
+                Text("Properties")
+                    .font(.headline)
+                Spacer()
+                Label(inspectorSection.title, systemImage: inspectorSection.icon)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(inspectorSection.tint)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 48)
+            Divider()
+            switch inspectorSection {
             case .media:
                 MediaInspector(
                     timeline: $project.timeline,
                     selectedClipID: selectedClipID,
                     playhead: playback.currentTime,
-                    projectDuration: project.duration,
+                    split: splitSelectedClip
+                )
+            case .branding:
+                BrandingInspector(
+                    overlays: brandingOverlaysBinding,
+                    selectedID: $selectedBrandingID,
                     packageURL: openProject.packageURL,
-                    branding: brandingOverlaysBinding,
-                    split: splitSelectedClip,
                     importImage: importBrandingImage
                 )
             case .canvas:
@@ -776,39 +906,333 @@ struct EditorView: View {
         .background(Color(nsColor: .underPageBackgroundColor))
     }
 
-    private var editorToolRail: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 7) {
-                ForEach(EditorInspectorSection.allCases) { section in
+    private var editorLibrary: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 4) {
+                ForEach(EditorLibrarySection.allCases) { section in
                     Button {
-                        inspectorSection = section
-                        showsCanvasInspector = true
+                        librarySection = section
                     } label: {
                         VStack(spacing: 4) {
                             Image(systemName: section.icon)
                                 .font(.system(size: 16, weight: .semibold))
-                                .frame(width: 34, height: 30)
-                                .background(section.tint.opacity(inspectorSection == section ? 0.22 : 0.11))
-                                .foregroundStyle(section.tint)
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
                             Text(section.title)
-                                .font(.system(size: 9, weight: inspectorSection == section ? .semibold : .regular))
-                                .foregroundStyle(inspectorSection == section ? .primary : .secondary)
+                                .font(.system(size: 9.5, weight: .medium))
                                 .lineLimit(1)
                         }
-                        .frame(width: 58, height: 50)
-                        .background(inspectorSection == section ? Color.accentColor.opacity(0.07) : .clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .foregroundStyle(librarySection == section ? Color.white : Color.secondary)
+                        .frame(width: 62, height: 48)
+                        .background(
+                            librarySection == section ? Color.accentColor : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        )
                     }
                     .buttonStyle(.plain)
                     .help(section.title)
                 }
+                Spacer(minLength: 8)
             }
+            .padding(.horizontal, 7)
             .padding(.vertical, 10)
+            .frame(width: 76)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(librarySection.title)
+                        .font(.headline)
+                    Text(librarySection.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                .padding(.horizontal, 14)
+                .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+                Divider()
+                ScrollView {
+                    editorLibraryContent
+                        .padding(12)
+                }
+            }
+            .frame(width: 210)
         }
-        .frame(width: 70)
+        .frame(width: 286)
         .background(Color(nsColor: .controlBackgroundColor))
-        .accessibilityLabel("Editor tools")
+        .accessibilityLabel("Create library")
+    }
+
+    @ViewBuilder
+    private var editorLibraryContent: some View {
+        switch librarySection {
+        case .media:
+            VStack(alignment: .leading, spacing: 12) {
+                EditorLibraryPrimaryButton(
+                    title: "Import video",
+                    subtitle: "Add at \(format(playback.currentTime))",
+                    systemImage: "film.badge.plus"
+                ) {
+                    importVideos([], at: playback.currentTime)
+                }
+                librarySectionLabel("Project media")
+                EditorLibraryItemRow(
+                    title: "Screen recording",
+                    subtitle: "Original capture",
+                    systemImage: "display",
+                    tint: .blue,
+                    isSelected: selectedClipID == screenRecordingClip?.id
+                ) {
+                    selectClip(screenRecordingClip?.id)
+                }
+                ForEach(project.videoAssets ?? []) { asset in
+                    EditorLibraryItemRow(
+                        title: asset.name,
+                        subtitle: "\(format(asset.duration)) · \(asset.width)×\(asset.height)",
+                        systemImage: "film",
+                        tint: .blue,
+                        isSelected: selectedClipID.flatMap { id in
+                            project.timeline.clips.first(where: { $0.id == id })?.sourceMediaID
+                        } == asset.id
+                    ) {
+                        selectClip(project.timeline.clips.first(where: { $0.sourceMediaID == asset.id })?.id)
+                    }
+                }
+            }
+        case .templates:
+            VStack(alignment: .leading, spacing: 12) {
+                EditorLibraryPrimaryButton(
+                    title: "Intro & outro library",
+                    subtitle: "Insert a premade scene",
+                    systemImage: "play.square.stack"
+                ) {
+                    showVideoLibrary(at: playback.currentTime)
+                }
+                librarySectionLabel("Promo layout")
+                libraryNavigationButton(
+                    title: "Build demo flow",
+                    subtitle: "Webcam intro, product and CTA",
+                    icon: "rectangle.3.group",
+                    section: .layouts
+                )
+                libraryNavigationButton(
+                    title: "Style the canvas",
+                    subtitle: "Background, frame and spacing",
+                    icon: "paintpalette",
+                    section: .canvas
+                )
+            }
+        case .text:
+            VStack(alignment: .leading, spacing: 12) {
+                EditorLibraryPrimaryButton(
+                    title: "Add text",
+                    subtitle: "Create at the playhead",
+                    systemImage: "text.badge.plus",
+                    action: addTextOverlay
+                )
+                librarySectionLabel("Text clips")
+                if (project.textOverlays ?? []).isEmpty {
+                    libraryEmptyState("No text yet", icon: "textformat")
+                }
+                ForEach(project.textOverlays ?? []) { item in
+                    EditorLibraryItemRow(
+                        title: item.text,
+                        subtitle: "\(format(item.startTime))–\(format(item.endTime))",
+                        systemImage: "textformat",
+                        tint: .pink,
+                        isSelected: selectedTextID == item.id
+                    ) {
+                        selectText(item.id)
+                    }
+                }
+            }
+        case .audio:
+            VStack(alignment: .leading, spacing: 12) {
+                EditorLibraryPrimaryButton(
+                    title: "Import audio",
+                    subtitle: "Music, voiceover or sound",
+                    systemImage: "music.note"
+                ) {
+                    importAudio([], at: playback.currentTime)
+                }
+                libraryNavigationButton(
+                    title: "Voice & mix",
+                    subtitle: "Noise, volume and click sounds",
+                    icon: "slider.horizontal.3",
+                    section: .audio
+                )
+                librarySectionLabel("Audio clips")
+                if (project.audioAssets ?? []).isEmpty {
+                    libraryEmptyState("No imported audio", icon: "waveform")
+                }
+                ForEach(project.audioAssets ?? []) { item in
+                    EditorLibraryItemRow(
+                        title: item.name,
+                        subtitle: "\(format(item.startTime)) · \(format(item.duration))",
+                        systemImage: "waveform",
+                        tint: .green,
+                        isSelected: selectedAudioID == item.id
+                    ) {
+                        selectAudio(item.id)
+                    }
+                }
+            }
+        case .brand:
+            VStack(alignment: .leading, spacing: 12) {
+                EditorLibraryPrimaryButton(
+                    title: "Add logo or image",
+                    subtitle: "Stored inside this project",
+                    systemImage: "photo.badge.plus",
+                    action: importBrandingImage
+                )
+                librarySectionLabel("Brand elements")
+                if (project.brandingOverlays ?? []).isEmpty {
+                    libraryEmptyState("No brand assets", icon: "photo.on.rectangle")
+                }
+                ForEach(project.brandingOverlays ?? []) { item in
+                    EditorLibraryItemRow(
+                        title: item.name,
+                        subtitle: "\(format(item.startTime))–\(format(item.endTime))",
+                        systemImage: "photo",
+                        tint: .orange,
+                        isSelected: selectedBrandingID == item.id
+                    ) {
+                        selectBranding(item.id)
+                    }
+                }
+            }
+        case .enhance:
+            VStack(alignment: .leading, spacing: 10) {
+                libraryActionButton(
+                    title: "Remove silent pauses",
+                    subtitle: waveform.isEmpty ? "Audio analysis unavailable" : "Tighten the recording",
+                    icon: "waveform.slash",
+                    disabled: waveform.isEmpty,
+                    action: prepareSilentPauseRemoval
+                )
+                libraryActionButton(
+                    title: "Smart zoom from clicks",
+                    subtitle: "Rebuild editable zoom moments",
+                    icon: "viewfinder"
+                ) {
+                    showsRegenerateZoomConfirmation = true
+                }
+                libraryNavigationButton(
+                    title: "Manual zoom moments",
+                    subtitle: "Add or remove precise focus",
+                    icon: "plus.magnifyingglass",
+                    section: .zoom
+                )
+                libraryNavigationButton(
+                    title: "Cursor",
+                    subtitle: "Motion, scale and click emphasis",
+                    icon: "cursorarrow.motionlines",
+                    section: .cursor
+                )
+                libraryNavigationButton(
+                    title: "Webcam moments",
+                    subtitle: "Focus, resize and return",
+                    icon: "person.crop.rectangle",
+                    section: .webcam
+                )
+                libraryNavigationButton(
+                    title: "Captions",
+                    subtitle: "Generate or edit subtitles",
+                    icon: "captions.bubble",
+                    section: .captions
+                )
+                libraryNavigationButton(
+                    title: "Privacy & highlights",
+                    subtitle: "Blur or emphasize an area",
+                    icon: "rectangle.dashed",
+                    section: .overlays
+                )
+            }
+        }
+    }
+
+    private func librarySectionLabel(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.top, 2)
+    }
+
+    private func libraryEmptyState(_ title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: 54, alignment: .center)
+    }
+
+    private func libraryNavigationButton(
+        title: String,
+        subtitle: String,
+        icon: String,
+        section: EditorInspectorSection
+    ) -> some View {
+        EditorLibraryActionRow(title: title, subtitle: subtitle, systemImage: icon) {
+            inspectorSection = section
+            showsCanvasInspector = true
+        }
+    }
+
+    private func libraryActionButton(
+        title: String,
+        subtitle: String,
+        icon: String,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        EditorLibraryActionRow(title: title, subtitle: subtitle, systemImage: icon, action: action)
+            .disabled(disabled)
+    }
+
+    private func selectClip(_ id: UUID?) {
+        guard let id else { return }
+        selectedClipID = id
+        selectedTextID = nil
+        selectedBrandingID = nil
+        selectedAudioID = nil
+        selectedTrackID = TimelineTrack.primaryVideoID
+        inspectorSection = .media
+        showsCanvasInspector = true
+    }
+
+    private var screenRecordingClip: TimelineClip? {
+        let importedIDs = Set((project.videoAssets ?? []).map(\.id))
+        return project.timeline.clips.first { !importedIDs.contains($0.sourceMediaID) }
+    }
+
+    private func selectText(_ id: UUID) {
+        selectedTextID = id
+        selectedClipID = nil
+        selectedBrandingID = nil
+        selectedAudioID = nil
+        selectedTrackID = (project.textOverlays ?? []).first(where: { $0.id == id })?.trackID ?? TimelineTrack.defaultTextID
+        inspectorSection = .text
+        showsCanvasInspector = true
+        playback.seek(to: (project.textOverlays ?? []).first(where: { $0.id == id })?.startTime ?? playback.currentTime)
+    }
+
+    private func selectAudio(_ id: UUID) {
+        selectedAudioID = id
+        selectedClipID = nil
+        selectedTextID = nil
+        selectedBrandingID = nil
+        inspectorSection = .audio
+        showsCanvasInspector = true
+        playback.seek(to: (project.audioAssets ?? []).first(where: { $0.id == id })?.startTime ?? playback.currentTime)
+    }
+
+    private func selectBranding(_ id: UUID) {
+        selectedBrandingID = id
+        selectedClipID = nil
+        selectedTextID = nil
+        selectedAudioID = nil
+        selectedTrackID = (project.brandingOverlays ?? []).first(where: { $0.id == id })?.trackID ?? TimelineTrack.defaultOverlayID
+        inspectorSection = .branding
+        showsCanvasInspector = true
+        playback.seek(to: (project.brandingOverlays ?? []).first(where: { $0.id == id })?.startTime ?? playback.currentTime)
     }
 
     private func createDemoFlow(
@@ -839,14 +1263,6 @@ struct EditorView: View {
         project.cameraKeyframes.sort { $0.time < $1.time }
         playback.seek(to: 0)
         hasUnsavedChanges = true
-        Task {
-            await playback.updateMetalPreview(
-                project: project,
-                packageURL: openProject.packageURL,
-                events: openProject.events
-            )
-            playback.seek(to: 0)
-        }
     }
 
     private func addTextOverlay() {
@@ -980,15 +1396,21 @@ struct EditorView: View {
             let destination = directory.appending(path: filename)
             try FileManager.default.copyItem(at: sourceURL, to: destination)
             var overlays = project.brandingOverlays ?? []
-            overlays.append(BrandingOverlay(
+            let item = BrandingOverlay(
                 name: sourceURL.deletingPathExtension().lastPathComponent,
                 assetPath: "assets/branding/\(filename)",
                 startTime: playback.currentTime,
                 endTime: min(project.duration, playback.currentTime + 5),
                 trackID: selectedOverlayTrackID
-            ))
+            )
+            overlays.append(item)
             project.brandingOverlays = overlays
-            inspectorSection = .media
+            selectedBrandingID = item.id
+            selectedClipID = nil
+            selectedTextID = nil
+            selectedAudioID = nil
+            librarySection = .brand
+            inspectorSection = .branding
             hasUnsavedChanges = true
         } catch {
             brandingImportError = error.localizedDescription
@@ -1445,26 +1867,77 @@ private enum ExportPreset: String, CaseIterable, Identifiable {
     }
 }
 
-private enum EditorInspectorSection: String, CaseIterable, Identifiable {
-    case media, canvas, text, audio, cursor, zoom, webcam, layouts, captions, overlays
+private enum EditorLibrarySection: String, CaseIterable, Identifiable {
+    case media, templates, text, audio, brand, enhance
+
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .media: "Cut"
-        case .canvas: "Style"
+        case .media: "Media"
+        case .templates: "Templates"
+        case .text: "Text"
+        case .audio: "Audio"
+        case .brand: "Brand"
+        case .enhance: "Enhance"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .media: "Recordings and imported video"
+        case .templates: "Premade scenes and promo layouts"
+        case .text: "Titles, labels and calls to action"
+        case .audio: "Music, voice and sound"
+        case .brand: "Logos and product imagery"
+        case .enhance: "Editable smart actions"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .media: "film.stack"
+        case .templates: "play.square.stack"
+        case .text: "textformat"
+        case .audio: "waveform"
+        case .brand: "photo.on.rectangle"
+        case .enhance: "wand.and.stars"
+        }
+    }
+}
+
+enum EditorSelectionKind {
+    case video, branding, text, audio
+
+    var inspectorSection: EditorInspectorSection {
+        switch self {
+        case .video: .media
+        case .branding: .branding
+        case .text: .text
+        case .audio: .audio
+        }
+    }
+}
+
+enum EditorInspectorSection: String, CaseIterable, Identifiable {
+    case media, branding, canvas, text, audio, cursor, zoom, webcam, layouts, captions, overlays
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .media: "Video"
+        case .branding: "Brand"
+        case .canvas: "Canvas"
         case .text: "Text"
         case .audio: "Audio"
         case .cursor: "Cursor"
         case .zoom: "Zoom"
-        case .webcam: "Camera"
-        case .layouts: "Demo"
-        case .captions: "Subs"
+        case .webcam: "Webcam"
+        case .layouts: "Layout"
+        case .captions: "Captions"
         case .overlays: "Privacy"
         }
     }
     var icon: String {
         switch self {
         case .media: "film.stack"
+        case .branding: "photo"
         case .canvas: "paintpalette"
         case .text: "textformat"
         case .audio: "waveform"
@@ -1479,6 +1952,7 @@ private enum EditorInspectorSection: String, CaseIterable, Identifiable {
     var tint: Color {
         switch self {
         case .media: .red
+        case .branding: .orange
         case .canvas: .indigo
         case .text: .pink
         case .audio: .green
@@ -1489,6 +1963,105 @@ private enum EditorInspectorSection: String, CaseIterable, Identifiable {
         case .captions: .yellow
         case .overlays: .mint
         }
+    }
+}
+
+private struct EditorLibraryPrimaryButton: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.callout.weight(.semibold))
+                    Text(subtitle).font(.caption2).opacity(0.78)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 11)
+            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+    }
+}
+
+private struct EditorLibraryActionRow: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 30, height: 30)
+                    .background(Color.accentColor.opacity(0.11), in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 3)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct EditorLibraryItemRow: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let tint: Color
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 32, height: 32)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(7)
+            .background(
+                isSelected ? Color.accentColor.opacity(0.13) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1656,11 +2229,7 @@ private struct MediaInspector: View {
     @Binding var timeline: Timeline
     let selectedClipID: UUID?
     let playhead: Double
-    let projectDuration: Double
-    let packageURL: URL
-    @Binding var branding: [BrandingOverlay]
     let split: () -> Void
-    let importImage: () -> Void
 
     var body: some View {
         Form {
@@ -1712,59 +2281,6 @@ private struct MediaInspector: View {
                 }
             }
 
-            Section("Branding") {
-                Button("Add logo or image…", systemImage: "photo.badge.plus", action: importImage)
-                Text("Images are stored inside the project and rendered into preview and export.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if branding.isEmpty {
-                    Text("No branding images")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach($branding) { $item in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 9) {
-                            if let image = image(for: item) {
-                                Image(nsImage: image)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(width: 38, height: 30)
-                            } else {
-                                Image(systemName: "photo.badge.exclamationmark")
-                                    .frame(width: 38, height: 30)
-                            }
-                            TextField("Image name", text: $item.name)
-                            Button(role: .destructive) {
-                                branding.removeAll { $0.id == item.id }
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                        HStack {
-                            TextField("Start", value: $item.startTime, format: .number.precision(.fractionLength(1)))
-                            TextField("End", value: $item.endTime, format: .number.precision(.fractionLength(1)))
-                        }
-                        Picker("Sizing", selection: $item.contentMode) {
-                            ForEach(BrandingContentMode.allCases, id: \.self) { mode in
-                                Text(mode.displayName).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        LabeledContent("Position X", value: item.normalizedX, format: .number.precision(.fractionLength(2)))
-                        Slider(value: $item.normalizedX, in: 0...1)
-                        LabeledContent("Position Y", value: item.normalizedY, format: .number.precision(.fractionLength(2)))
-                        Slider(value: $item.normalizedY, in: 0...1)
-                        LabeledContent("Width", value: item.normalizedWidth, format: .percent)
-                        Slider(value: $item.normalizedWidth, in: 0.05...1)
-                        LabeledContent("Height", value: item.normalizedHeight, format: .percent)
-                        Slider(value: $item.normalizedHeight, in: 0.05...1)
-                        LabeledContent("Opacity", value: item.opacity, format: .percent)
-                        Slider(value: $item.opacity, in: 0...1)
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
         }
         .formStyle(.grouped)
     }
@@ -1807,10 +2323,6 @@ private struct MediaInspector: View {
         )
     }
 
-    private func image(for item: BrandingOverlay) -> NSImage? {
-        NSImage(contentsOf: packageURL.appending(path: item.assetPath))
-    }
-
     private func format(_ seconds: Double) -> String {
         String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
     }
@@ -1819,6 +2331,89 @@ private struct MediaInspector: View {
         Binding(
             get: { clip.wrappedValue.layout ?? .default },
             set: { clip.wrappedValue.layout = $0 }
+        )
+    }
+}
+
+private struct BrandingInspector: View {
+    @Binding var overlays: [BrandingOverlay]
+    @Binding var selectedID: UUID?
+    let packageURL: URL
+    let importImage: () -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                Button("Add logo or image…", systemImage: "photo.badge.plus", action: importImage)
+                    .buttonStyle(.borderedProminent)
+                Text("Brand assets are stored inside the project and rendered in preview and export.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let binding = selectedBinding {
+                Section("Asset") {
+                    HStack(spacing: 10) {
+                        if let image = NSImage(contentsOf: packageURL.appending(path: binding.wrappedValue.assetPath)) {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 48, height: 38)
+                        } else {
+                            Image(systemName: "photo.badge.exclamationmark")
+                                .frame(width: 48, height: 38)
+                        }
+                        TextField("Name", text: binding.name)
+                    }
+                    HStack {
+                        TextField("Start", value: binding.startTime, format: .number.precision(.fractionLength(1)))
+                        TextField("End", value: binding.endTime, format: .number.precision(.fractionLength(1)))
+                    }
+                }
+                Section("Layout") {
+                    Picker("Sizing", selection: binding.contentMode) {
+                        ForEach(BrandingContentMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    LabeledContent("Position X", value: binding.normalizedX.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedX, in: 0...1)
+                    LabeledContent("Position Y", value: binding.normalizedY.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedY, in: 0...1)
+                    LabeledContent("Width", value: binding.normalizedWidth.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedWidth, in: 0.05...1)
+                    LabeledContent("Height", value: binding.normalizedHeight.wrappedValue, format: .percent)
+                    Slider(value: binding.normalizedHeight, in: 0.05...1)
+                    LabeledContent("Opacity", value: binding.opacity.wrappedValue, format: .percent)
+                    Slider(value: binding.opacity, in: 0...1)
+                    LabeledContent("Corner radius", value: binding.cornerRadius.wrappedValue, format: .percent)
+                    Slider(value: binding.cornerRadius, in: 0...0.5)
+                }
+                Section {
+                    Button("Delete brand element", systemImage: "trash", role: .destructive) {
+                        overlays.removeAll { $0.id == selectedID }
+                        selectedID = nil
+                    }
+                }
+            } else {
+                ContentUnavailableView(
+                    "Select a brand element",
+                    systemImage: "photo.on.rectangle",
+                    description: Text("Choose an image in the library or timeline to edit its placement.")
+                )
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var selectedBinding: Binding<BrandingOverlay>? {
+        guard let selectedID, overlays.contains(where: { $0.id == selectedID }) else { return nil }
+        return Binding(
+            get: { overlays.first(where: { $0.id == selectedID })! },
+            set: { value in
+                guard let index = overlays.firstIndex(where: { $0.id == selectedID }) else { return }
+                overlays[index] = value
+            }
         )
     }
 }
@@ -2658,6 +3253,26 @@ private struct CaptionInspector: View {
     }
 }
 
+private struct TimelinePanelResizeHandle: View {
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(.clear)
+            .frame(height: 8)
+            .overlay {
+                Capsule()
+                    .fill(.secondary.opacity(isHovering ? 0.55 : 0.24))
+                    .frame(width: 44, height: 3)
+            }
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+            .animation(.easeOut(duration: 0.12), value: isHovering)
+            .help("Drag to resize the timeline")
+            .accessibilityLabel("Timeline height")
+    }
+}
+
 private enum EditorTimelineLaneRole: Equatable {
     case video, text, overlay, zoom, webcam, interactions, audio, music
 }
@@ -2669,6 +3284,12 @@ private struct EditorTimelineLane: Identifiable {
     var id: UUID { track.id }
 }
 
+private enum TimelineVisualTokens {
+    static let shellRadius = 14.0
+    static let clipRadius = 6.0
+    static let separatorOpacity = 0.09
+}
+
 private struct ProfessionalTimelineView: View {
     @Binding var timeline: Timeline
     @Binding var brandingOverlays: [BrandingOverlay]
@@ -2677,6 +3298,7 @@ private struct ProfessionalTimelineView: View {
     @Binding var customTracks: [TimelineTrack]
     let cameraKeyframes: [CameraKeyframe]
     let webcamKeyframes: [WebcamLayoutKeyframe]
+    let hasCamera: Bool
     let events: [InteractionEvent]
     let waveform: [Double]
     let sourceDuration: Double
@@ -2698,9 +3320,9 @@ private struct ProfessionalTimelineView: View {
     @State private var snappingEnabled = true
     @State private var playheadDragOrigin: Double?
 
-    private let headerWidth = 142.0
+    private let headerWidth = 156.0
     private let rulerHeight = 28.0
-    private let laneHeight = 44.0
+    private let laneHeight = 48.0
     private static let zoomTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000201")!
     private static let webcamTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000202")!
     private static let interactionTrackID = UUID(uuidString: "00000000-0000-0000-0000-000000000203")!
@@ -2727,59 +3349,121 @@ private struct ProfessionalTimelineView: View {
                 }
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.quaternary))
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: TimelineVisualTokens.shellRadius, style: .continuous))
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
         .focusable()
         .onDeleteCommand(perform: deleteSelection)
         .accessibilityLabel("Video editing timeline")
     }
 
     private var timelineToolbar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Menu {
-                Button("Overlay Track", systemImage: "rectangle.stack.badge.plus", action: addOverlayTrack)
-                Divider()
-                Button("Text", systemImage: "text.badge.plus", action: addText)
                 Button("Import Video…", systemImage: "film.badge.plus") { importVideos([], playhead) }
                 Button("Music / Audio…", systemImage: "music.note") { importAudio([], playhead) }
                 Button("Video Template", systemImage: "play.square.stack") { showVideoLibrary(playhead) }
+                Divider()
+                Button("Text", systemImage: "text.badge.plus", action: addText)
             } label: {
                 Label("Add", systemImage: "plus")
             }
-            .menuStyle(.borderlessButton)
-            Divider().frame(height: 16)
+            .menuStyle(.button)
+
+            Button(action: addOverlayTrack) {
+                Label("Track", systemImage: "rectangle.stack.badge.plus")
+            }
+            .help("Add an overlay track")
+
+            ControlGroup {
+                Button(action: splitSelection) {
+                    Label("Split", systemImage: "scissors")
+                }
+                .disabled(!canSplitSelection)
+                .help("Split the selected item at the playhead")
+
+                Button(role: .destructive, action: deleteSelection) {
+                    Label("Delete", systemImage: "trash")
+                }
+                .disabled(!canDeleteSelection)
+                .help("Delete the selected item")
+            }
+            .controlSize(.small)
+
+            if let selectedItemLabel {
+                Text(selectedItemLabel)
+                    .font(.caption)
+                    .foregroundStyle(.primary.opacity(0.82))
+                    .lineLimit(1)
+                    .frame(maxWidth: 150, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.thinMaterial, in: Capsule())
+            }
+
+            Spacer(minLength: 8)
+
+            Text(formatTime(playhead))
+                .font(.caption.monospacedDigit().weight(.medium))
+                .foregroundStyle(.primary)
+
             Button {
                 snappingEnabled.toggle()
             } label: {
-                Label("Snap", systemImage: snappingEnabled ? "arrow.left.and.right.righttriangle.left.righttriangle.right.fill" : "arrow.left.and.right.righttriangle.left.righttriangle.right")
+                Image(systemName: snappingEnabled ? "arrow.left.and.right.righttriangle.left.righttriangle.right.fill" : "arrow.left.and.right.righttriangle.left.righttriangle.right")
             }
             .buttonStyle(.borderless)
             .tint(snappingEnabled ? .accentColor : .secondary)
-            Spacer()
-            Text(formatTime(playhead))
-                .font(.caption.monospacedDigit().weight(.medium))
-            Image(systemName: "timeline.selection")
-                .foregroundStyle(.secondary)
+            .help(snappingEnabled ? "Disable snapping" : "Enable snapping")
+
+            Button {
+                pixelsPerSecond = max(40, pixelsPerSecond - 24)
+            } label: {
+                Image(systemName: "minus.magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .help("Zoom out timeline")
             Slider(value: $pixelsPerSecond, in: 40...360)
-                .frame(width: 120)
+                .frame(width: 82)
                 .help("Timeline zoom — scroll vertically over the timeline")
-            Image(systemName: "plus.magnifyingglass")
-                .foregroundStyle(.secondary)
+            Button {
+                pixelsPerSecond = min(360, pixelsPerSecond + 24)
+            } label: {
+                Image(systemName: "plus.magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .help("Zoom in timeline")
         }
         .font(.caption)
-        .padding(.horizontal, 10)
-        .frame(height: 34)
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(.primary.opacity(TimelineVisualTokens.separatorOpacity))
+                .frame(height: 1)
+        }
     }
 
     private var trackHeaders: some View {
         VStack(spacing: 1) {
             Color.clear.frame(width: headerWidth, height: rulerHeight)
-                .overlay(alignment: .leading) {
-                    Text("TRACKS")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, 10)
+                .overlay {
+                    HStack(spacing: 6) {
+                        Text("Tracks")
+                            .font(.caption.weight(.semibold))
+                        Text("\(lanes.count)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(action: addOverlayTrack) {
+                            Image(systemName: "plus")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Add an overlay track")
+                    }
+                    .padding(.horizontal, 10)
                 }
             ForEach(lanes) { lane in
                 TimelineTrackHeader(
@@ -2797,6 +3481,7 @@ private struct ProfessionalTimelineView: View {
                 .frame(width: headerWidth, height: laneHeight)
             }
         }
+        .background(.thinMaterial)
     }
 
     private var timelineContent: some View {
@@ -2827,19 +3512,26 @@ private struct ProfessionalTimelineView: View {
             importVideos(movieURLs, min(max(location.x / pixelsPerSecond, 0), timeline.duration))
             return true
         }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.34))
     }
 
     @ViewBuilder
     private func laneView(_ lane: EditorTimelineLane) -> some View {
         ZStack(alignment: .leading) {
             Rectangle()
-                .fill(selectedTrackID == lane.id ? Color.accentColor.opacity(0.07) : .black.opacity(0.06))
+                .fill(selectedTrackID == lane.id ? Color.accentColor.opacity(0.09) : .black.opacity(0.035))
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(.primary.opacity(TimelineVisualTokens.separatorOpacity))
+                        .frame(height: 1)
+                }
                 .contentShape(Rectangle())
                 .onTapGesture {
                     selectedTrackID = lane.id
                     selectedClipID = nil
                     selectedBrandingID = nil
                     selectedTextID = nil
+                    selectedAudioID = nil
                 }
 
             switch lane.role {
@@ -2857,6 +3549,7 @@ private struct ProfessionalTimelineView: View {
                             selectedClipID = clip.id
                             selectedBrandingID = nil
                             selectedTextID = nil
+                            selectedAudioID = nil
                             selectedTrackID = lane.id
                         },
                         move: { moveClip(clip.id, by: $0) },
@@ -2885,6 +3578,7 @@ private struct ProfessionalTimelineView: View {
                                 selectedTextID = item.id
                                 selectedClipID = nil
                                 selectedBrandingID = nil
+                                selectedAudioID = nil
                                 selectedTrackID = lane.id
                             },
                             move: { moveText(item.id, by: $0) },
@@ -2912,6 +3606,7 @@ private struct ProfessionalTimelineView: View {
                                 selectedBrandingID = overlay.id
                                 selectedClipID = nil
                                 selectedTextID = nil
+                                selectedAudioID = nil
                                 selectedTrackID = lane.id
                             },
                             move: { moveOverlay(overlay.id, by: $0) },
@@ -2975,6 +3670,12 @@ private struct ProfessionalTimelineView: View {
                     )
                 }
             }
+
+            if let hint = emptyLaneHint(for: lane) {
+                TimelineEmptyLaneHint(systemImage: hint.icon, text: hint.text)
+                    .padding(.leading, 12)
+                    .allowsHitTesting(false)
+            }
         }
         .frame(width: timelineWidth, height: laneHeight, alignment: .leading)
         .clipped()
@@ -2992,21 +3693,70 @@ private struct ProfessionalTimelineView: View {
                 $0.id != TimelineTrack.defaultOverlayID
             }
             .map { EditorTimelineLane(track: $0, role: .overlay, isRemovable: true) }
-        return [
-            EditorTimelineLane(track: video, role: .video, isRemovable: false),
-            EditorTimelineLane(track: text, role: .text, isRemovable: false),
-            EditorTimelineLane(track: branding, role: .overlay, isRemovable: false)
-        ] + custom + [
-            EditorTimelineLane(track: TimelineTrack(id: Self.zoomTrackID, name: "Auto Zoom", kind: .overlay), role: .zoom, isRemovable: false),
-            EditorTimelineLane(track: TimelineTrack(id: Self.webcamTrackID, name: "Webcam", kind: .overlay), role: .webcam, isRemovable: false),
-            EditorTimelineLane(track: TimelineTrack(id: Self.interactionTrackID, name: "Interactions", kind: .overlay), role: .interactions, isRemovable: false),
-            EditorTimelineLane(track: TimelineTrack(id: Self.audioTrackID, name: "Audio", kind: .audio), role: .audio, isRemovable: false),
-            EditorTimelineLane(track: TimelineTrack(id: Self.musicTrackID, name: "Music", kind: .audio), role: .music, isRemovable: false)
-        ]
+        var result = [EditorTimelineLane(track: video, role: .video, isRemovable: false)]
+        if hasCamera {
+            result.append(EditorTimelineLane(
+                track: TimelineTrack(id: Self.webcamTrackID, name: "Webcam", kind: .overlay),
+                role: .webcam, isRemovable: false
+            ))
+        }
+        result.append(EditorTimelineLane(track: text, role: .text, isRemovable: false))
+        result.append(EditorTimelineLane(track: branding, role: .overlay, isRemovable: false))
+        result.append(contentsOf: custom)
+        if !zoomMarkers.isEmpty || selectedTrackID == Self.zoomTrackID {
+            result.append(EditorTimelineLane(
+                track: TimelineTrack(id: Self.zoomTrackID, name: "Zoom", kind: .overlay),
+                role: .zoom, isRemovable: false
+            ))
+        }
+        if !events.isEmpty || selectedTrackID == Self.interactionTrackID {
+            result.append(EditorTimelineLane(
+                track: TimelineTrack(id: Self.interactionTrackID, name: "Clicks", kind: .overlay),
+                role: .interactions, isRemovable: false
+            ))
+        }
+        result.append(EditorTimelineLane(
+            track: TimelineTrack(id: Self.audioTrackID, name: "Recording Audio", kind: .audio),
+            role: .audio, isRemovable: false
+        ))
+        result.append(EditorTimelineLane(
+            track: TimelineTrack(id: Self.musicTrackID, name: "Music", kind: .audio),
+            role: .music, isRemovable: false
+        ))
+        return result
+    }
+
+    private func emptyLaneHint(for lane: EditorTimelineLane) -> (icon: String, text: String)? {
+        switch lane.role {
+        case .video:
+            timeline.clips.isEmpty ? ("film", "Import a video to begin") : nil
+        case .text:
+            textOverlays.contains { ($0.trackID ?? TimelineTrack.defaultTextID) == lane.id }
+                ? nil : ("textformat", "Add text from the toolbar")
+        case .overlay:
+            brandingOverlays.contains { ($0.trackID ?? TimelineTrack.defaultOverlayID) == lane.id }
+                ? nil : ("photo", "Branding and images appear here")
+        case .zoom:
+            zoomMarkers.isEmpty ? ("viewfinder", "Zoom automation appears here") : nil
+        case .webcam:
+            webcamKeyframes.isEmpty ? ("person.crop.rectangle", "Webcam automation appears here") : nil
+        case .interactions:
+            events.isEmpty ? ("cursorarrow.click", "Recorded clicks appear here") : nil
+        case .audio:
+            waveform.isEmpty ? ("waveform", "No recorded waveform") : nil
+        case .music:
+            audioAssets.isEmpty ? ("music.note", "Import audio to add a music clip") : nil
+        }
     }
 
     private var overlayTracks: [TimelineTrack] {
-        lanes.filter { $0.role == .overlay }.map(\.track)
+        let defaults = [trackState(fallback: .defaultOverlay)]
+        let custom = customTracks.filter {
+            $0.kind == .overlay &&
+            $0.id != TimelineTrack.defaultTextID &&
+            $0.id != TimelineTrack.defaultOverlayID
+        }
+        return defaults + custom
     }
 
     private var timelineWidth: Double {
@@ -3373,6 +4123,61 @@ private struct ProfessionalTimelineView: View {
         else if let selectedAudioID { deleteAudio(selectedAudioID) }
     }
 
+    private func splitSelection() {
+        if let selectedClipID { splitClip(selectedClipID, at: playhead) }
+        else if let selectedTextID { splitText(selectedTextID, at: playhead) }
+        else if let selectedBrandingID { splitOverlay(selectedBrandingID, at: playhead) }
+    }
+
+    private var canSplitSelection: Bool {
+        if let selectedClipID,
+           let clip = timeline.clips.first(where: { $0.id == selectedClipID }) {
+            return !trackState(fallback: .primaryVideo).isLocked &&
+                playhead > clip.timelineStart && playhead < clip.timelineStart + clip.duration
+        }
+        if let selectedTextID,
+           let item = textOverlays.first(where: { $0.id == selectedTextID }) {
+            return !trackState(fallback: .defaultText).isLocked &&
+                playhead > item.startTime && playhead < item.endTime
+        }
+        if let selectedBrandingID,
+           let item = brandingOverlays.first(where: { $0.id == selectedBrandingID }) {
+            let trackID = item.trackID ?? TimelineTrack.defaultOverlayID
+            return !(overlayTracks.first { $0.id == trackID }?.isLocked ?? false) &&
+                playhead > item.startTime && playhead < item.endTime
+        }
+        return false
+    }
+
+    private var canDeleteSelection: Bool {
+        if selectedClipID != nil { return !trackState(fallback: .primaryVideo).isLocked }
+        if selectedTextID != nil { return !trackState(fallback: .defaultText).isLocked }
+        if let selectedBrandingID,
+           let item = brandingOverlays.first(where: { $0.id == selectedBrandingID }) {
+            let trackID = item.trackID ?? TimelineTrack.defaultOverlayID
+            return !(overlayTracks.first { $0.id == trackID }?.isLocked ?? false)
+        }
+        return selectedAudioID != nil
+    }
+
+    private var selectedItemLabel: String? {
+        if let selectedClipID,
+           let clip = timeline.clips.first(where: { $0.id == selectedClipID }) {
+            return videoAssets.first(where: { $0.id == clip.sourceMediaID })?.name ?? "Screen clip"
+        }
+        if let selectedTextID,
+           let item = textOverlays.first(where: { $0.id == selectedTextID }) {
+            return item.text.isEmpty ? "Text" : item.text
+        }
+        if let selectedBrandingID {
+            return brandingOverlays.first(where: { $0.id == selectedBrandingID })?.name
+        }
+        if let selectedAudioID {
+            return audioAssets.first(where: { $0.id == selectedAudioID })?.name
+        }
+        return nil
+    }
+
     private func formatTime(_ seconds: Double) -> String {
         String(format: "%02d:%02d.%01d", Int(seconds) / 60, Int(seconds) % 60, Int(seconds * 10) % 10)
     }
@@ -3435,12 +4240,15 @@ private struct TimelineTrackHeader: View {
     let toggleMute: () -> Void
     let rename: (String) -> Void
     let remove: () -> Void
+    @State private var isHovering = false
 
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: icon)
-                .frame(width: 16)
-                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                .font(.caption.weight(.semibold))
+                .frame(width: 22, height: 22)
+                .foregroundStyle(tint)
+                .background(tint.opacity(isSelected ? 0.2 : 0.1), in: RoundedRectangle(cornerRadius: 5))
             if canRename {
                 TimelineTrackNameField(name: track.name, rename: rename)
             } else {
@@ -3454,6 +4262,7 @@ private struct TimelineTrackHeader: View {
                     Image(systemName: track.isMuted ? "speaker.slash.fill" : "speaker.wave.2")
                 }
                 .buttonStyle(.borderless)
+                .opacity(controlOpacity)
                 .help(track.isMuted ? "Enable track" : "Mute track")
             }
             if role == .video || role == .text || role == .overlay {
@@ -3461,6 +4270,7 @@ private struct TimelineTrackHeader: View {
                     Image(systemName: track.isLocked ? "lock.fill" : "lock.open")
                 }
                 .buttonStyle(.borderless)
+                .opacity(controlOpacity)
                 .help(track.isLocked ? "Unlock track" : "Lock track")
             }
         }
@@ -3468,11 +4278,16 @@ private struct TimelineTrackHeader: View {
         .background(isSelected ? Color.accentColor.opacity(0.08) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
+        .onHover { isHovering = $0 }
         .contextMenu {
             if canRemove {
                 Button("Delete Track", systemImage: "trash", role: .destructive, action: remove)
             }
         }
+    }
+
+    private var controlOpacity: Double {
+        isSelected || isHovering || track.isLocked || track.isMuted ? 1 : 0.46
     }
 
     private var icon: String {
@@ -3486,6 +4301,29 @@ private struct TimelineTrackHeader: View {
         case .audio: "waveform"
         case .music: "music.note"
         }
+    }
+
+    private var tint: Color {
+        switch role {
+        case .video: .blue
+        case .text, .zoom: .purple
+        case .overlay: .orange
+        case .webcam: .pink
+        case .interactions: .indigo
+        case .audio, .music: .teal
+        }
+    }
+}
+
+private struct TimelineEmptyLaneHint: View {
+    let systemImage: String
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
+            .font(.caption2)
+            .foregroundStyle(.secondary.opacity(0.72))
+            .lineLimit(1)
     }
 }
 
@@ -3504,6 +4342,30 @@ private struct TimelineTrackNameField: View {
             .font(.caption.weight(.medium))
             .lineLimit(1)
             .onSubmit { rename(value) }
+    }
+}
+
+private struct TimelineClipInteractionStyle: ViewModifier {
+    let isSelected: Bool
+    @State private var isHovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(isHovering && !isSelected ? 1.004 : 1)
+            .shadow(
+                color: .black.opacity(isSelected ? 0.3 : isHovering ? 0.2 : 0.08),
+                radius: isSelected ? 4 : isHovering ? 3 : 1,
+                y: isSelected ? 1.5 : isHovering ? 1 : 0.5
+            )
+            .onHover { isHovering = $0 }
+            .animation(.easeOut(duration: 0.14), value: isHovering)
+            .animation(.easeOut(duration: 0.14), value: isSelected)
+    }
+}
+
+private extension View {
+    func timelineClipInteraction(isSelected: Bool) -> some View {
+        modifier(TimelineClipInteractionStyle(isSelected: isSelected))
     }
 }
 
@@ -3595,9 +4457,9 @@ private struct TimelineVideoClip: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .fill(isSelected ? Color.accentColor : Color.blue.opacity(0.78))
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .stroke(isSelected ? .white.opacity(0.9) : .white.opacity(0.22), lineWidth: isSelected ? 1.5 : 0.5)
             HStack(spacing: 5) {
                 Image(systemName: "film.fill").font(.caption2)
@@ -3621,7 +4483,7 @@ private struct TimelineVideoClip: View {
         }
         .frame(width: displayedWidth, height: laneHeight - 8)
         .offset(x: displayedX, y: 4)
-        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius))
         .onTapGesture(perform: select)
         .gesture(DragGesture(minimumDistance: 4)
             .onChanged { if !isLocked { moveOffset = $0.translation.width } }
@@ -3634,6 +4496,7 @@ private struct TimelineVideoClip: View {
             Group { clipContextMenu }
                 .onAppear(perform: select)
         }
+        .timelineClipInteraction(isSelected: isSelected)
     }
 
     private var displayedX: Double {
@@ -3649,6 +4512,7 @@ private struct TimelineVideoClip: View {
             .fill(.white.opacity(0.85))
             .frame(width: 5, height: laneHeight - 16)
             .padding(.horizontal, 3)
+            .opacity(isSelected ? 1 : 0)
             .help("Drag to trim")
     }
 
@@ -3733,9 +4597,9 @@ private struct TimelineTextClip: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .fill(isSelected ? Color.purple : Color.purple.opacity(0.74))
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .stroke(.white.opacity(isSelected ? 0.9 : 0.24), lineWidth: isSelected ? 1.5 : 0.5)
             HStack(spacing: 5) {
                 Image(systemName: "textformat").font(.caption2)
@@ -3752,7 +4616,7 @@ private struct TimelineTextClip: View {
         }
         .frame(width: displayedWidth, height: laneHeight - 8)
         .offset(x: displayedX, y: 4)
-        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius))
         .onTapGesture(perform: select)
         .gesture(DragGesture(minimumDistance: 4)
             .onChanged { if !isLocked { moveOffset = $0.translation.width } }
@@ -3773,6 +4637,7 @@ private struct TimelineTextClip: View {
             Button("Duplicate", systemImage: "plus.square.on.square", action: duplicate).disabled(isLocked)
             Button("Delete", systemImage: "trash", role: .destructive, action: delete).disabled(isLocked)
         }
+        .timelineClipInteraction(isSelected: isSelected)
     }
 
     private var displayedX: Double { item.startTime * pixelsPerSecond + moveOffset + startTrimOffset }
@@ -3783,6 +4648,7 @@ private struct TimelineTextClip: View {
     private var trimHandle: some View {
         RoundedRectangle(cornerRadius: 2).fill(.white.opacity(0.86))
             .frame(width: 5, height: laneHeight - 16).padding(.horizontal, 3)
+            .opacity(isSelected ? 1 : 0)
     }
     private func trimGesture(isStart: Bool) -> some Gesture {
         DragGesture(minimumDistance: 0)
@@ -3821,9 +4687,9 @@ private struct TimelineAudioClip: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .fill(isSelected ? Color.teal : Color.teal.opacity(0.72))
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .stroke(.white.opacity(isSelected ? 0.9 : 0.24), lineWidth: isSelected ? 1.5 : 0.5)
             HStack(spacing: 5) {
                 Image(systemName: "waveform").font(.caption2)
@@ -3842,7 +4708,7 @@ private struct TimelineAudioClip: View {
         }
         .frame(width: displayedWidth, height: laneHeight - 8)
         .offset(x: displayedX, y: 4)
-        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius))
         .onTapGesture(perform: select)
         .gesture(DragGesture(minimumDistance: 4)
             .onChanged { moveOffset = $0.translation.width }
@@ -3858,6 +4724,7 @@ private struct TimelineAudioClip: View {
             Divider()
             Button("Delete", systemImage: "trash", role: .destructive, action: delete)
         }
+        .timelineClipInteraction(isSelected: isSelected)
     }
 
     private var displayedX: Double { item.startTime * pixelsPerSecond + moveOffset + startTrimOffset }
@@ -3865,6 +4732,7 @@ private struct TimelineAudioClip: View {
     private var trimHandle: some View {
         RoundedRectangle(cornerRadius: 2).fill(.white.opacity(0.86))
             .frame(width: 5, height: laneHeight - 16).padding(.horizontal, 3)
+            .opacity(isSelected ? 1 : 0)
     }
     private func trimGesture(isStart: Bool) -> some Gesture {
         DragGesture(minimumDistance: 0)
@@ -3905,9 +4773,9 @@ private struct TimelineOverlayClip: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .fill(isSelected ? Color.orange : Color.orange.opacity(0.72))
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius)
                 .stroke(.white.opacity(isSelected ? 0.9 : 0.24), lineWidth: isSelected ? 1.5 : 0.5)
             HStack(spacing: 5) {
                 Image(systemName: "photo.fill").font(.caption2)
@@ -3924,7 +4792,7 @@ private struct TimelineOverlayClip: View {
         }
         .frame(width: displayedWidth, height: laneHeight - 8)
         .offset(x: displayedX, y: 4)
-        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: TimelineVisualTokens.clipRadius))
         .onTapGesture(perform: select)
         .gesture(DragGesture(minimumDistance: 4)
             .onChanged { if !isLocked { moveOffset = $0.translation.width } }
@@ -3950,6 +4818,7 @@ private struct TimelineOverlayClip: View {
             Button("Duplicate", systemImage: "plus.square.on.square", action: duplicate).disabled(isLocked)
             Button("Delete", systemImage: "trash", role: .destructive, action: delete).disabled(isLocked)
         }
+        .timelineClipInteraction(isSelected: isSelected)
     }
 
     private var displayedX: Double { overlay.startTime * pixelsPerSecond + moveOffset + startTrimOffset }
@@ -3961,6 +4830,7 @@ private struct TimelineOverlayClip: View {
     private var overlayTrimHandle: some View {
         RoundedRectangle(cornerRadius: 2).fill(.white.opacity(0.86))
             .frame(width: 5, height: laneHeight - 16).padding(.horizontal, 3)
+            .opacity(isSelected ? 1 : 0)
     }
     private func trimGesture(isStart: Bool) -> some Gesture {
         DragGesture(minimumDistance: 0)

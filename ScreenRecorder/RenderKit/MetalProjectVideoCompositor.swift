@@ -8,6 +8,70 @@ import Metal
 import MetalKit
 import simd
 
+struct CapturaVideoRenderSnapshot: @unchecked Sendable {
+    let project: ScreenProject
+    let events: [InteractionEvent]
+    let cursorSamples: [CursorSample]
+    let geometry: ExportGeometry
+    let brandingImages: [UUID: CGImage]
+}
+
+final class CapturaVideoRenderState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CapturaVideoRenderSnapshot
+
+    init(
+        project: ScreenProject,
+        events: [InteractionEvent],
+        geometry: ExportGeometry,
+        brandingImages: [UUID: CGImage]
+    ) {
+        value = CapturaVideoRenderSnapshot(
+            project: project,
+            events: events,
+            cursorSamples: Self.makeCursorSamples(from: events),
+            geometry: geometry,
+            brandingImages: brandingImages
+        )
+    }
+
+    func snapshot() -> CapturaVideoRenderSnapshot {
+        lock.withLock { value }
+    }
+
+    func update(
+        project: ScreenProject,
+        events: [InteractionEvent]? = nil,
+        geometry: ExportGeometry,
+        brandingImages: [UUID: CGImage]? = nil
+    ) {
+        lock.withLock {
+            let resolvedEvents = events ?? value.events
+            let cursorSamples = if let events, events != value.events {
+                Self.makeCursorSamples(from: events)
+            } else {
+                value.cursorSamples
+            }
+            value = CapturaVideoRenderSnapshot(
+                project: project,
+                events: resolvedEvents,
+                cursorSamples: cursorSamples,
+                geometry: geometry,
+                brandingImages: brandingImages ?? value.brandingImages
+            )
+        }
+    }
+
+    private static func makeCursorSamples(from events: [InteractionEvent]) -> [CursorSample] {
+        events.compactMap { event -> CursorSample? in
+            guard let x = event.normalizedX, let y = event.normalizedY,
+                  event.type == .mouseMove || event.type == .click || event.type == .mouseDown else { return nil }
+            return CursorSample(time: event.timestamp, normalizedX: x, normalizedY: y, cursorType: .arrow)
+        }
+        .sorted { $0.time < $1.time }
+    }
+}
+
 final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
     let timeRange: CMTimeRange
     let enablePostProcessing = true
@@ -16,10 +80,7 @@ final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProt
     let passthroughTrackID = kCMPersistentTrackID_Invalid
     let screenTrackID: CMPersistentTrackID
     let cameraTrackID: CMPersistentTrackID?
-    let project: ScreenProject
-    let events: [InteractionEvent]
-    let geometry: ExportGeometry
-    let brandingImages: [UUID: CGImage]
+    let renderState: CapturaVideoRenderState
 
     init(
         timeRange: CMTimeRange,
@@ -28,15 +89,18 @@ final class CapturaVideoInstruction: NSObject, AVVideoCompositionInstructionProt
         project: ScreenProject,
         events: [InteractionEvent],
         geometry: ExportGeometry,
-        brandingImages: [UUID: CGImage] = [:]
+        brandingImages: [UUID: CGImage] = [:],
+        renderState: CapturaVideoRenderState? = nil
     ) {
         self.timeRange = timeRange
         self.screenTrackID = screenTrackID
         self.cameraTrackID = cameraTrackID
-        self.project = project
-        self.events = events
-        self.geometry = geometry
-        self.brandingImages = brandingImages
+        self.renderState = renderState ?? CapturaVideoRenderState(
+            project: project,
+            events: events,
+            geometry: geometry,
+            brandingImages: brandingImages
+        )
         requiredSourceTrackIDs = [screenTrackID, cameraTrackID].compactMap { id in
             guard let id else { return nil }
             return NSNumber(value: id)
@@ -142,12 +206,22 @@ final class MetalProjectRenderer: @unchecked Sendable {
         var values: SIMD4<Float>
     }
 
+    private struct CachedTextTexture {
+        let item: TextOverlay
+        let texture: MTLTexture
+    }
+
+    private struct CachedBrandingTexture {
+        let assetPath: String
+        let texture: MTLTexture
+    }
+
     private let commandQueue: MTLCommandQueue
     private let textureCache: CVMetalTextureCache
     private let pipeline: MTLRenderPipelineState
     private let textureLoader: MTKTextureLoader
-    private var brandingTextureCache: [UUID: MTLTexture] = [:]
-    private var textTextureCache: [TextOverlay: MTLTexture] = [:]
+    private var brandingTextureCache: [UUID: CachedBrandingTexture] = [:]
+    private var textTextureCache: [UUID: CachedTextTexture] = [:]
     private let lock = NSLock()
 
     init() throws {
@@ -185,34 +259,36 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 throw MetalCompositorError.textureCreation
             }
             let cameraTexture = camera.flatMap(texture(from:)) ?? sourceTexture
+            let snapshot = instruction.renderState.snapshot()
+            let project = snapshot.project
             let timelineTime = max(0, compositionTime.seconds)
-            let activeClip = instruction.project.timeline.clip(at: timelineTime)
+            let activeClip = project.timeline.clip(at: timelineTime)
             let importedMedia = activeClip.flatMap { clip in
-                instruction.project.videoAssets?.first { $0.id == clip.sourceMediaID }
+                project.videoAssets?.first { $0.id == clip.sourceMediaID }
             }
             let isPrimaryClip = importedMedia == nil
-            let sourceTime = instruction.project.timeline.sourceTime(at: timelineTime) ?? timelineTime
+            let sourceTime = project.timeline.sourceTime(at: timelineTime) ?? timelineTime
             let keyframe = isPrimaryClip ? CameraKeyframeInterpolator().value(
                 at: sourceTime,
-                frames: instruction.project.cameraKeyframes
+                frames: project.cameraKeyframes
             ) : nil
-            let cursor = isPrimaryClip ? cursorSample(at: sourceTime, instruction: instruction) : nil
-            let appearance = instruction.project.settings.appearance ?? .default
+            let cursor = isPrimaryClip ? cursorSample(at: sourceTime, project: project, samples: snapshot.cursorSamples) : nil
+            let appearance = project.settings.appearance ?? .default
             let colors = backgroundColors(appearance)
             let gradientRadians = appearance.gradientAngle * .pi / 180
-            let geometry = instruction.geometry
+            let geometry = snapshot.geometry
             let outputSize = geometry.outputSize
-            let activeTransition = instruction.project.timeline.activeTransition(at: timelineTime)
-            let mutedTracks = Set((instruction.project.timelineTracks ?? []).filter(\.isMuted).map(\.id))
-            let activeBranding = (instruction.project.brandingOverlays ?? []).last {
+            let activeTransition = project.timeline.activeTransition(at: timelineTime)
+            let mutedTracks = Set((project.timelineTracks ?? []).filter(\.isMuted).map(\.id))
+            let activeBranding = (project.brandingOverlays ?? []).last {
                 timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
                 !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultOverlayID)
             }
-            let activeText = (instruction.project.textOverlays ?? []).last {
+            let activeText = (project.textOverlays ?? []).last {
                 timelineTime >= $0.startTime && timelineTime <= $0.endTime &&
                 !mutedTracks.contains($0.trackID ?? TimelineTrack.defaultTextID)
             }
-            let layoutSegments = (instruction.project.layoutSegments ?? [])
+            let layoutSegments = (project.layoutSegments ?? [])
                 .filter { $0.endTime > $0.startTime }
                 .sorted { lhs, rhs in
                     lhs.startTime == rhs.startTime ? lhs.endTime < rhs.endTime : lhs.startTime < rhs.startTime
@@ -222,7 +298,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             }
             let webcamLayout = WebcamLayoutInterpolator().value(
                 at: timelineTime,
-                frames: instruction.project.webcamKeyframes ?? [],
+                frames: project.webcamKeyframes ?? [],
                 fallback: appearance
             )
             let cameraWidth = max(2, geometry.screenRect.width * min(max(webcamLayout.width, 0.05), 1))
@@ -245,7 +321,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
             }
             let layout = activeClip?.layout ?? .default
             let sourceAspect = Double(importedMedia.map { Double($0.width) / Double(max(1, $0.height)) }
-                ?? Double(instruction.project.settings.sourceDisplay.width) / Double(max(1, instruction.project.settings.sourceDisplay.height)))
+                ?? Double(project.settings.sourceDisplay.width) / Double(max(1, project.settings.sourceDisplay.height)))
             let destinationAspect = geometry.screenRect.width / max(geometry.screenRect.height, 1)
             var relativeWidth = min(max(layout.scale, 0.05), 2)
             var relativeHeight = relativeWidth
@@ -307,9 +383,9 @@ final class MetalProjectRenderer: @unchecked Sendable {
             let cameraOpacity = camera == nil || !isPrimaryClip
                 ? 0
                 : min(max(webcamLayout.opacity * resolvedLayout.cameraOpacity, 0), 1)
-            let brandingImage = activeBranding.flatMap { instruction.brandingImages[$0.id] }
+            let brandingImage = activeBranding.flatMap { snapshot.brandingImages[$0.id] }
             let brandingTexture = activeBranding.flatMap { overlay in
-                cachedBrandingTexture(for: overlay.id, image: brandingImage)
+                cachedBrandingTexture(for: overlay.id, assetPath: overlay.assetPath, image: brandingImage)
             } ?? sourceTexture
             let brandingAspect = brandingImage.map { Float($0.width) / Float(max(1, $0.height)) } ?? 1
             let textAnimation = activeText.map { textAnimationState(for: $0, at: timelineTime) }
@@ -324,14 +400,14 @@ final class MetalProjectRenderer: @unchecked Sendable {
             let brandingRect: SIMD4<Float>
             let brandingOpacity: Float
             if let activeBranding {
-                let x = visualValue(for: activeBranding.id, property: .positionX, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedX)
-                let y = visualValue(for: activeBranding.id, property: .positionY, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedY)
-                let width = visualValue(for: activeBranding.id, property: .width, at: timelineTime, project: instruction.project, fallback: activeBranding.normalizedWidth)
+                let x = visualValue(for: activeBranding.id, property: .positionX, at: timelineTime, project: project, fallback: activeBranding.normalizedX)
+                let y = visualValue(for: activeBranding.id, property: .positionY, at: timelineTime, project: project, fallback: activeBranding.normalizedY)
+                let width = visualValue(for: activeBranding.id, property: .width, at: timelineTime, project: project, fallback: activeBranding.normalizedWidth)
                 brandingRect = SIMD4(
                     Float(x - width / 2), Float(y - activeBranding.normalizedHeight / 2),
                     Float(width), Float(activeBranding.normalizedHeight)
                 )
-                let opacity = visualValue(for: activeBranding.id, property: .opacity, at: timelineTime, project: instruction.project, fallback: activeBranding.opacity)
+                let opacity = visualValue(for: activeBranding.id, property: .opacity, at: timelineTime, project: project, fallback: activeBranding.opacity)
                 brandingOpacity = brandingImage == nil ? 0 : Float(min(max(opacity, 0), 1))
             } else {
                 brandingRect = .zero
@@ -340,11 +416,11 @@ final class MetalProjectRenderer: @unchecked Sendable {
             let textRect: SIMD4<Float>
             let textOpacity: Float
             if let activeText {
-                let keyedScale = visualValue(for: activeText.id, property: .scale, at: timelineTime, project: instruction.project, fallback: 1)
+                let keyedScale = visualValue(for: activeText.id, property: .scale, at: timelineTime, project: project, fallback: 1)
                 let scale = (textAnimation?.scale ?? 1) * keyedScale
-                let baseWidth = visualValue(for: activeText.id, property: .width, at: timelineTime, project: instruction.project, fallback: activeText.normalizedWidth)
-                let x = visualValue(for: activeText.id, property: .positionX, at: timelineTime, project: instruction.project, fallback: activeText.normalizedX)
-                let y = visualValue(for: activeText.id, property: .positionY, at: timelineTime, project: instruction.project, fallback: activeText.normalizedY)
+                let baseWidth = visualValue(for: activeText.id, property: .width, at: timelineTime, project: project, fallback: activeText.normalizedWidth)
+                let x = visualValue(for: activeText.id, property: .positionX, at: timelineTime, project: project, fallback: activeText.normalizedX)
+                let y = visualValue(for: activeText.id, property: .positionY, at: timelineTime, project: project, fallback: activeText.normalizedY)
                 let width = min(max(baseWidth * scale, 0.05), 1)
                 let height = width * outputSize.width / max(outputSize.height, 1) / Double(textAspect)
                 textRect = SIMD4(
@@ -352,7 +428,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                     Float(y - height / 2 + (textAnimation?.offsetY ?? 0)),
                     Float(width), Float(height)
                 )
-                let opacity = visualValue(for: activeText.id, property: .opacity, at: timelineTime, project: instruction.project, fallback: activeText.opacity)
+                let opacity = visualValue(for: activeText.id, property: .opacity, at: timelineTime, project: project, fallback: activeText.opacity)
                 textOpacity = Float(min(max(opacity * (textAnimation?.opacity ?? 1), 0), 1))
             } else {
                 textRect = .zero
@@ -374,12 +450,12 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 cursor: SIMD4(
                     Float(cursor?.normalizedX ?? 0.5), Float(cursor?.normalizedY ?? 0.5),
                     cursor == nil ? 0 : 1,
-                    Float((instruction.project.settings.cursor ?? .default).size)
+                    Float((project.settings.cursor ?? .default).size)
                 ),
                 chrome: SIMD4(
-                    (instruction.project.settings.appearance ?? .default).showsWindowFrame ? 1 : 0,
+                    appearance.showsWindowFrame ? 1 : 0,
                     Float(geometry.windowCornerRadius / outputSize.width),
-                    Float((instruction.project.settings.appearance ?? .default).shadowStrength * geometry.scale / outputSize.width),
+                    Float(appearance.shadowStrength * geometry.scale / outputSize.width),
                     0
                 ),
                 output: SIMD4(Float(outputSize.width), Float(outputSize.height), 0, 0),
@@ -415,7 +491,7 @@ final class MetalProjectRenderer: @unchecked Sendable {
                 ),
                 cameraBorderColor: cameraBorderColor
             )
-            var overlays = activeOverlays(at: timelineTime, instruction: instruction)
+            var overlays = activeOverlays(at: timelineTime, project: project)
             if overlays.isEmpty {
                 overlays = [GPUOverlay(rect: .zero, values: .zero)]
             }
@@ -478,26 +554,25 @@ final class MetalProjectRenderer: @unchecked Sendable {
         return left.value + (right.value - left.value) * progress
     }
 
-    private func cachedBrandingTexture(for id: UUID, image: CGImage?) -> MTLTexture? {
-        if let cached = brandingTextureCache[id] { return cached }
+    private func cachedBrandingTexture(for id: UUID, assetPath: String, image: CGImage?) -> MTLTexture? {
+        if let cached = brandingTextureCache[id], cached.assetPath == assetPath { return cached.texture }
         guard let image,
               let texture = try? textureLoader.newTexture(
-                cgImage: image,
-                options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
+                  cgImage: image,
+                  options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
               ) else { return nil }
-        brandingTextureCache[id] = texture
+        brandingTextureCache[id] = CachedBrandingTexture(assetPath: assetPath, texture: texture)
         return texture
     }
 
     private func cachedTextTexture(for item: TextOverlay) -> MTLTexture? {
-        if let cached = textTextureCache[item] { return cached }
+        if let cached = textTextureCache[item.id], cached.item == item { return cached.texture }
         guard let image = makeTextImage(item),
               let texture = try? textureLoader.newTexture(
-                cgImage: image,
-                options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
+                  cgImage: image,
+                  options: [.SRGB: false, .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue)]
               ) else { return nil }
-        textTextureCache[item] = texture
-        if textTextureCache.count > 96 { textTextureCache.removeAll(keepingCapacity: true) }
+        textTextureCache[item.id] = CachedTextTexture(item: item, texture: texture)
         return texture
     }
 
@@ -629,23 +704,38 @@ final class MetalProjectRenderer: @unchecked Sendable {
         }
     }
 
-    private func cursorSample(at sourceTime: Double, instruction: CapturaVideoInstruction) -> CursorSample? {
-        let settings = instruction.project.settings.cursor ?? .default
+    private func cursorSample(
+        at sourceTime: Double,
+        project: ScreenProject,
+        samples: [CursorSample]
+    ) -> CursorSample? {
+        let settings = project.settings.cursor ?? .default
         guard settings.isVisible else { return nil }
-        let samples = instruction.events.compactMap { event -> CursorSample? in
-            guard let x = event.normalizedX, let y = event.normalizedY,
-                  event.type == .mouseMove || event.type == .click || event.type == .mouseDown else { return nil }
-            return CursorSample(time: event.timestamp, normalizedX: x, normalizedY: y, cursorType: .arrow)
-        }
         guard let sample = CursorInterpolator().sample(at: sourceTime, from: samples) else { return nil }
         if settings.hidesWhenIdle,
-           let closest = samples.min(by: { abs($0.time - sourceTime) < abs($1.time - sourceTime) }),
+           let closest = nearestCursorSample(to: sourceTime, in: samples),
            abs(closest.time - sourceTime) > 1.5 { return nil }
         return sample
     }
 
-    private func activeOverlays(at time: Double, instruction: CapturaVideoInstruction) -> [GPUOverlay] {
-        (instruction.project.overlays ?? []).filter {
+    private func nearestCursorSample(to time: Double, in samples: [CursorSample]) -> CursorSample? {
+        guard !samples.isEmpty else { return nil }
+        var lowerBound = 0
+        var upperBound = samples.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            if samples[middle].time < time { lowerBound = middle + 1 }
+            else { upperBound = middle }
+        }
+        if lowerBound == 0 { return samples[0] }
+        if lowerBound == samples.count { return samples[samples.count - 1] }
+        let previous = samples[lowerBound - 1]
+        let next = samples[lowerBound]
+        return abs(previous.time - time) <= abs(next.time - time) ? previous : next
+    }
+
+    private func activeOverlays(at time: Double, project: ScreenProject) -> [GPUOverlay] {
+        (project.overlays ?? []).filter {
             time >= $0.startTime && time <= $0.endTime
         }.prefix(16).map { overlay in
             GPUOverlay(

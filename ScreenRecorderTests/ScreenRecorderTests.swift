@@ -77,6 +77,77 @@ final class ScreenRecorderTests: XCTestCase {
         XCTAssertEqual(decoded.settings.appearance, project.settings.appearance)
     }
 
+    func testPreviewAppearanceEditsStayOnLiveRenderPath() {
+        let original = sampleProject(duration: 8)
+        var edited = original
+        edited.settings.appearance = .default
+        edited.settings.appearance?.padding = 128
+        edited.settings.appearance?.cameraPositionX = 0.24
+        edited.settings.appearance?.vignette = 0.35
+
+        XCTAssertFalse(PreviewUpdateClassifier.requiresRebuild(from: original, to: edited))
+    }
+
+    func testPreviewTimelineAndAudioEditsRequireCompositionRebuild() {
+        let original = sampleProject(duration: 8)
+        var timelineEdit = original
+        timelineEdit.timeline.clips[0].sourceEnd = 6
+        var audioEdit = original
+        audioEdit.settings.audio = ProjectAudioSettings(systemVolume: 0.5)
+
+        XCTAssertTrue(PreviewUpdateClassifier.requiresRebuild(from: original, to: timelineEdit))
+        XCTAssertTrue(PreviewUpdateClassifier.requiresRebuild(from: original, to: audioEdit))
+    }
+
+    func testPreviewBrandingAssetsReloadWithoutReplacingPlayerItem() {
+        let original = sampleProject(duration: 8)
+        var edited = original
+        edited.brandingOverlays = [BrandingOverlay(
+            name: "Logo",
+            assetPath: "assets/branding/logo.png",
+            startTime: 0,
+            endTime: 8
+        )]
+
+        XCTAssertFalse(PreviewUpdateClassifier.requiresRebuild(from: original, to: edited))
+        XCTAssertTrue(PreviewUpdateClassifier.brandingAssetsChanged(from: original, to: edited))
+    }
+
+    func testEditorSelectionRoutesToContextualProperties() {
+        XCTAssertEqual(EditorSelectionKind.video.inspectorSection, .media)
+        XCTAssertEqual(EditorSelectionKind.branding.inspectorSection, .branding)
+        XCTAssertEqual(EditorSelectionKind.text.inspectorSection, .text)
+        XCTAssertEqual(EditorSelectionKind.audio.inspectorSection, .audio)
+    }
+
+    func testMetalPreviewRenderStatePublishesLatestVisualSnapshot() {
+        let original = sampleProject(duration: 8)
+        var edited = original
+        edited.settings.appearance = .default
+        edited.settings.appearance?.cameraWidth = 0.42
+        let outputSize = CGSize(width: 1920, height: 1080)
+        let originalGeometry = ExportGeometry(
+            outputSize: outputSize,
+            sourceSize: original.settings.canvas,
+            appearance: original.settings.appearance ?? .default
+        )
+        let editedGeometry = ExportGeometry(
+            outputSize: outputSize,
+            sourceSize: edited.settings.canvas,
+            appearance: edited.settings.appearance ?? .default
+        )
+        let state = CapturaVideoRenderState(
+            project: original,
+            events: [],
+            geometry: originalGeometry,
+            brandingImages: [:]
+        )
+
+        state.update(project: edited, events: [], geometry: editedGeometry)
+
+        XCTAssertEqual(state.snapshot().project.settings.appearance?.cameraWidth, 0.42)
+    }
+
     func testLegacyAudioSettingsGainProcessingDefaults() throws {
         let settings = try JSONDecoder().decode(ProjectAudioSettings.self, from: Data(#"{"systemVolume":0.8}"#.utf8))
 
